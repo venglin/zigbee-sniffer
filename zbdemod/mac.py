@@ -204,8 +204,37 @@ def parse(psdu: bytes, decode_zigbee: bool = True) -> MacFrame:
     return mf
 
 
+STACK_PROFILES = {1: "Zigbee", 2: "ZigbeePRO"}
+
+
 def _parse_beacon(mf: MacFrame, decode_zigbee: bool) -> None:
-    r = _Reader(mf.payload)
+    b = decode_beacon(mf.payload)
+    mf.info.append(f"{'PAN-coord ' if b.pan_coordinator else ''}assoc={'yes' if b.assoc_permit else 'no'}")
+    if decode_zigbee and b.zigbee:
+        prof = STACK_PROFILES.get(b.stack_profile, f"stack{b.stack_profile}")
+        mf.info.append(
+            f"{prof} v{b.protocol_version} depth={b.depth} router_cap={int(b.router_capacity)} "
+            f"ed_cap={int(b.end_device_capacity)} epid={b.epid}"
+        )
+
+
+@dataclass
+class Beacon:
+    """Superframe flags and the Zigbee beacon payload (when present)."""
+
+    pan_coordinator: bool
+    assoc_permit: bool
+    zigbee: bool = False
+    stack_profile: int | None = None
+    protocol_version: int | None = None
+    router_capacity: bool | None = None
+    depth: int | None = None
+    end_device_capacity: bool | None = None
+    epid: str | None = None
+
+
+def decode_beacon(payload: bytes) -> Beacon:
+    r = _Reader(payload)
     sf = r.u16()
     gts = r.u8()
     if gts & 7:
@@ -214,74 +243,127 @@ def _parse_beacon(mf: MacFrame, decode_zigbee: bool) -> None:
         r.take(3 * (gts & 7))
     pend = r.u8()
     r.take(2 * (pend & 7) + 8 * ((pend >> 4) & 7))
-    coord = bool(sf & 0x4000)
-    permit = bool(sf & 0x8000)
-    mf.info.append(f"{'PAN-coord ' if coord else ''}assoc={'yes' if permit else 'no'}")
+    b = Beacon(pan_coordinator=bool(sf & 0x4000), assoc_permit=bool(sf & 0x8000))
     zb = r.rest()
-    if decode_zigbee and len(zb) >= 11 and zb[0] == 0:
-        stack = zb[1] & 0x0F
-        proto = zb[1] >> 4
-        router_cap = bool(zb[2] & 0x04)
-        depth = (zb[2] >> 3) & 0x0F
-        ed_cap = bool(zb[2] & 0x80)
-        epid = fmt_ext(zb[3:11])
-        prof = {1: "Zigbee", 2: "ZigbeePRO"}.get(stack, f"stack{stack}")
-        mf.info.append(
-            f"{prof} v{proto} depth={depth} router_cap={int(router_cap)} "
-            f"ed_cap={int(ed_cap)} epid={epid}"
-        )
+    if len(zb) >= 11 and zb[0] == 0:
+        b.zigbee = True
+        b.stack_profile = zb[1] & 0x0F
+        b.protocol_version = zb[1] >> 4
+        b.router_capacity = bool(zb[2] & 0x04)
+        b.depth = (zb[2] >> 3) & 0x0F
+        b.end_device_capacity = bool(zb[2] & 0x80)
+        b.epid = fmt_ext(zb[3:11])
+    return b
+
+
+@dataclass
+class NwkFrame:
+    """Zigbee NWK header fields (protocol version 2, Data or Command)."""
+
+    ftype: int
+    dst: int
+    src: int
+    radius: int
+    seq: int
+    end_device_initiator: bool = False
+    dst_ieee: str | None = None
+    src_ieee: str | None = None
+    relays: list[int] = field(default_factory=list)  # closest to the destination first
+    relay_index: int | None = None
+    secured: bool = False
+    key_id: int | None = None
+    frame_counter: int | None = None
+    sec_src: str | None = None  # aux header source = the device that sent this hop
+    key_seq: int | None = None
+    payload: bytes = b""  # ciphertext + MIC when secured
+
+    @property
+    def type_name(self) -> str:
+        return ("Data", "Cmd", "Rsvd", "Inter-PAN")[self.ftype]
+
+    @property
+    def command(self) -> int | None:
+        return self.payload[0] if self.ftype == 1 and not self.secured and self.payload else None
+
+
+NWK_GREEN_POWER = "gp"
+NWK_INTER_PAN = "inter-pan"
+
+
+def decode_nwk(data: bytes) -> NwkFrame | str | None:
+    """Decode a Zigbee NWK header.
+
+    Returns an NwkFrame, NWK_GREEN_POWER / NWK_INTER_PAN for those frame kinds,
+    or None when the payload is not Zigbee. Raises ValueError when truncated.
+    """
+    r = _Reader(data)
+    fc = r.u16()
+    ftype = fc & 3
+    proto = (fc >> 2) & 0x0F
+    if proto == 3:
+        return NWK_GREEN_POWER
+    if ftype == 3:
+        return NWK_INTER_PAN
+    if proto != 2:
+        return None
+    n = NwkFrame(ftype=ftype, dst=r.u16(), src=r.u16(), radius=r.u8(), seq=r.u8())
+    n.end_device_initiator = bool(fc & 0x2000)
+    if fc & 0x0800:
+        n.dst_ieee = fmt_ext(r.take(8))
+    if fc & 0x1000:
+        n.src_ieee = fmt_ext(r.take(8))
+    if fc & 0x0100:
+        r.u8()  # multicast control
+    if fc & 0x0400:
+        count = r.u8()
+        n.relay_index = r.u8()
+        n.relays = [r.u16() for _ in range(count)]
+    if fc & 0x0200:
+        n.secured = True
+        sc = r.u8()
+        n.frame_counter = struct.unpack("<I", r.take(4))[0]
+        n.key_id = (sc >> 3) & 3
+        if sc & 0x20:  # extended nonce
+            n.sec_src = fmt_ext(r.take(8))
+        if n.key_id == 1:
+            n.key_seq = r.u8()
+    n.payload = r.rest()
+    return n
 
 
 def parse_nwk(data: bytes) -> str:
     """One-line summary of a Zigbee NWK frame (and APS header when unencrypted)."""
-    r = _Reader(data)
     try:
-        fc = r.u16()
-        ftype = fc & 3
-        proto = (fc >> 2) & 0x0F
-        if proto == 3:
-            return "ZGP (Green Power)"
-        if ftype == 3:
-            return "Zigbee Inter-PAN " + _parse_aps(data[2:])
-        if proto != 2:
-            return f"(non-Zigbee payload, nwk-ver {proto})"
-        dst = r.u16()
-        src = r.u16()
-        radius = r.u8()
-        seq = r.u8()
-        parts = [f"NWK {('Data', 'Cmd', 'Rsvd', 'Inter-PAN')[ftype]}"]
-        parts.append(f"{fmt_short(src)}->{fmt_short(dst)} r={radius} nseq={seq}")
-        if fc & 0x0800:
-            parts.append(f"dstIEEE={fmt_ext(r.take(8))}")
-        if fc & 0x1000:
-            parts.append(f"srcIEEE={fmt_ext(r.take(8))}")
-        if fc & 0x0100:
-            r.u8()  # multicast control
-        if fc & 0x0400:
-            count = r.u8()
-            r.u8()
-            r.take(2 * count)
-            parts.append(f"srcroute({count})")
-        if fc & 0x0200:
-            sc = r.u8()
-            fcnt = struct.unpack("<I", r.take(4))[0]
-            key_id = (sc >> 3) & 3
-            ext_nonce = bool(sc & 0x20)
-            sec = [f"enc({KEY_IDS[key_id]}", f"fc={fcnt}"]
-            if ext_nonce:
-                sec.append(f"src={fmt_ext(r.take(8))}")
-            if key_id == 1:
-                sec.append(f"kseq={r.u8()}")
-            parts.append(" ".join(sec) + ")")
-            return " ".join(parts)
-        payload = r.rest()
-        if ftype == 1 and payload:
-            parts.append(NWK_COMMANDS.get(payload[0], f"cmd 0x{payload[0]:02x}"))
-        elif ftype == 0:
-            parts.append(_parse_aps(payload))
-        return " ".join(parts)
+        n = decode_nwk(data)
     except ValueError:
         return "NWK (truncated)"
+    if n == NWK_GREEN_POWER:
+        return "ZGP (Green Power)"
+    if n == NWK_INTER_PAN:
+        return "Zigbee Inter-PAN " + _parse_aps(data[2:])
+    if n is None:
+        return f"(non-Zigbee payload, nwk-ver {(data[0] >> 2) & 0x0F})"
+    parts = [f"NWK {n.type_name}"]
+    parts.append(f"{fmt_short(n.src)}->{fmt_short(n.dst)} r={n.radius} nseq={n.seq}")
+    if n.dst_ieee:
+        parts.append(f"dstIEEE={n.dst_ieee}")
+    if n.src_ieee:
+        parts.append(f"srcIEEE={n.src_ieee}")
+    if n.relay_index is not None:
+        parts.append(f"srcroute({len(n.relays)})")
+    if n.secured:
+        sec = [f"enc({KEY_IDS[n.key_id]}", f"fc={n.frame_counter}"]
+        if n.sec_src:
+            sec.append(f"src={n.sec_src}")
+        if n.key_seq is not None:
+            sec.append(f"kseq={n.key_seq}")
+        parts.append(" ".join(sec) + ")")
+        return " ".join(parts)
+    if n.ftype == 1 and n.payload:
+        parts.append(NWK_COMMANDS.get(n.payload[0], f"cmd 0x{n.payload[0]:02x}"))
+    elif n.ftype == 0:
+        parts.append(_parse_aps(n.payload))
+    return " ".join(parts)
 
 
 def _parse_aps(data: bytes) -> str:

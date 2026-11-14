@@ -37,6 +37,9 @@ zbdemod-extcap = "zbdemod.extcap:main"
 [tool.setuptools]
 packages = ["zbdemod"]
 
+[tool.setuptools.package-data]
+zbdemod = ["web/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

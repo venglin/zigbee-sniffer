@@ -5,6 +5,7 @@
     python -m zbdemod scan   [-c 11-26] [--dwell 5]        hop channels, find networks
     python -m zbdemod record -c 15 -d 10 -o cap.cs8        save raw IQ (+ .json sidecar)
     python -m zbdemod file   cap.cs8 [--pcap out.pcap]     decode a recording
+    python -m zbdemod map    [-c 11-26] [--read cap.pcap]  live network map in the browser
     python -m zbdemod selftest                             synthetic end-to-end test
     python -m zbdemod extcap-install                       add the Wireshark capture interface
 """
@@ -489,6 +490,46 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp, False)
     sp.set_defaults(func=cmd_file)
 
+    sp = sub.add_parser(
+        "map",
+        help="map of the Zigbee networks in range, live in the browser",
+        description="Serve a live map of the networks, devices and radio links heard "
+        "(HackRF, recordings or PCAP files) and open it in the browser.",
+    )
+    sp.add_argument(
+        "-c",
+        "--channels",
+        help="channel(s) for the HackRF: 15, or 11-26 / 11,15,20,25 to hop (default 11); "
+        "can be changed from the page",
+    )
+    sp.add_argument("--dwell", type=float, default=5.0, help="seconds per channel when hopping (default 5)")
+    sp.add_argument(
+        "--read",
+        action="append",
+        metavar="PCAP",
+        help="build the map from a PCAP/PCAPNG capture instead of the HackRF (repeatable)",
+    )
+    sp.add_argument(
+        "--file",
+        action="append",
+        metavar="REC",
+        help="build the map from a raw IQ recording (.cs8/.cf32 + .json sidecar) instead of the HackRF (repeatable)",
+    )
+    sp.add_argument(
+        "--names",
+        help="device names: JSON {\"<IEEE>\": \"name\"}, or zigbee2mqtt's configuration.yaml / database.db",
+    )
+    sp.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="address to serve the page on (default 127.0.0.1: this computer only)",
+    )
+    sp.add_argument("--port", type=int, default=8088, help="HTTP port (default 8088, next free one if taken)")
+    sp.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    sp.add_argument("-v", "--verbose", action="store_true", help="also print every frame")
+    common(sp, True)
+    sp.set_defaults(func=cmd_map)
+
     sp = sub.add_parser("selftest", help="synthetic end-to-end test (no hardware)")
     sp.add_argument("--frames", type=int, default=100)
     sp.set_defaults(func=cmd_selftest)
@@ -501,6 +542,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--uninstall", action="store_true", help="remove the interface")
     sp.set_defaults(func=cmd_extcap_install)
     return p
+
+
+def cmd_map(args) -> int:
+    from . import webmap
+
+    return webmap.main(args)
 
 
 def cmd_extcap_install(args) -> int:

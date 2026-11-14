@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zigbee network map</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Ccircle cx='10' cy='10' r='4' fill='%232a78d6'/%3E%3Ccircle cx='3' cy='4' r='2' fill='%23898781'/%3E%3Ccircle cx='17' cy='5' r='2' fill='%23898781'/%3E%3Ccircle cx='14' cy='17' r='2' fill='%23898781'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <g stroke="var(--link)" stroke-width="1.4"><line x1="10" y1="10" x2="3" y2="4"/><line x1="10" y1="10" x2="17" y2="5"/><line x1="10" y1="10" x2="14" y2="17"/></g>
+      <circle cx="10" cy="10" r="4" fill="var(--s1)"/><circle cx="3" cy="4" r="2" fill="var(--muted)"/>
+      <circle cx="17" cy="5" r="2" fill="var(--muted)"/><circle cx="14" cy="17" r="2" fill="var(--muted)"/>
+    </svg>
+    <span>Zigbee network map</span>
+  </div>
+  <span class="chip" id="source"><span class="dot"></span><span>connecting…</span></span>
+  <div class="stats" id="stats"></div>
+  <div class="spacer"></div>
+  <div class="tuner">
+    <div class="channels" id="channels" role="group" aria-label="Channels"></div>
+    <div class="hop">
+      <button id="hopAll" title="Hop over all channels 11–26">Hop all</button>
+      <select id="dwell" aria-label="Seconds per channel when hopping" title="Seconds per channel when hopping">
+        <option value="2">2 s</option><option value="5">5 s</option><option value="15">15 s</option><option value="30">30 s</option>
+      </select>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar left">
+    <section>
+      <h2>Networks</h2>
+      <ul class="netlist" id="networks"></ul>
+      <p class="empty" id="noNetworks">No networks heard yet.</p>
+    </section>
+    <section>
+      <h2>View</h2>
+      <label class="row"><span>Color by</span>
+        <select id="colorBy"><option value="network">Network</option><option value="signal">Signal strength</option></select>
+      </label>
+      <label class="row"><span>Label</span>
+        <select id="labelBy">
+          <option value="name">Name or address</option><option value="short">Short address</option>
+          <option value="ieee">IEEE address</option><option value="vendor">Vendor</option><option value="none">None</option>
+        </select>
+      </label>
+      <label class="row"><span>Fade after</span>
+        <select id="staleAfter">
+          <option value="60">1 min silent</option><option value="300">5 min silent</option>
+          <option value="900">15 min silent</option><option value="3600">1 h silent</option><option value="0">never</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="showRoutes"> Links inferred from source routes</label>
+      <label class="check"><input type="checkbox" id="showFlows"> End-to-end traffic</label>
+      <label class="check"><input type="checkbox" id="hideStale"> Hide faded devices</label>
+    </section>
+    <section>
+      <h2>Legend</h2>
+      <div class="legend" id="legend"></div>
+    </section>
+    <section class="actions">
+      <button id="fit">Fit to view</button>
+      <button id="unpin">Unpin all</button>
+      <button id="reset">Clear map</button>
+    </section>
+  </aside>
+
+  <section class="stage" id="stage">
+    <svg id="graph" aria-label="Network graph">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,1 L9,5 L0,9 Z"/>
+        </marker>
+      </defs>
+      <g id="viewport"><g id="gLinks"></g><g id="gFlows"></g><g id="gHits"></g><g id="gNodes"></g></g>
+    </svg>
+    <div class="hint" id="hint"></div>
+    <div class="zoom">
+      <button id="zoomIn" aria-label="Zoom in">+</button>
+      <button id="zoomOut" aria-label="Zoom out">−</button>
+    </div>
+  </section>
+
+  <aside class="sidebar right" id="details" aria-live="polite"></aside>
+</main>
+
+<footer class="log" id="logPanel">
+  <div class="loghead">
+    <button id="logToggle" aria-expanded="true">▾ Frames</button>
+    <span id="logNote" class="note"></span>
+  </div>
+  <pre id="log" class="mono"></pre>
+</footer>
+<div class="tooltip" id="tooltip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -20,7 +20,10 @@ Highlights:
 - **Robust.** It is tested with ±150 kHz carrier offset and ±100 ppm clock drift, and keeps
   the HackRF DC spike out of band by tuning the LO 2 MHz off the channel.
 - **Fast enough.** About 2.5× real time on a desktop CPU (≈35 % of one core live).
-- **Wireshark ready.** It writes `LINKTYPE_IEEE802_15_4_TAP` PCAPs with the channel number.
+- **Wireshark ready.** It writes `LINKTYPE_IEEE802_15_4_TAP` PCAPs with the channel number,
+  and offers a live capture interface (extcap) in Wireshark's interface list.
+- **Network map.** `zbdemod map` draws the networks, devices and radio links it hears,
+  live in the browser. It needs no network key.
 - **No GNU Radio.** libhackrf is driven directly through `ctypes`.
 
 ## Installation
@@ -53,6 +56,9 @@ zbdemod file examples/synthetic.cs8 --pcap out.pcap
 
 # find networks: hop over channels 11-26, 5 s each
 zbdemod scan
+
+# live map of the networks in range, in the browser
+zbdemod map
 
 # decode one channel live and save a PCAP (Ctrl+C stops)
 zbdemod live -c 15 --pcap ch15.pcap
@@ -104,6 +110,50 @@ Without extcap, stream PCAP through a pipe instead. Frame lines then go to stder
 ```sh
 zbdemod live -c 15 --pcap - | wireshark -k -i -
 ```
+
+### Network map in the browser
+
+```sh
+zbdemod map                          # HackRF on channel 11
+zbdemod map -c 11-26 --dwell 15      # hop over all channels, 15 s each
+zbdemod map --read capture.pcapng    # from a Wireshark / tshark / zbdemod capture
+zbdemod map --file ch15.cs8          # from a raw IQ recording
+```
+
+`zbdemod map` starts a small local web server (standard library only, no extra
+packages, works offline) at <http://localhost:8088/> and opens the browser. The page
+draws every network it hears, the devices in it and the radio links between them,
+and updates live:
+
+- **Networks** (PAN ID, channel, extended PAN ID once a beacon is seen, encryption,
+  permit join) in a list. Devices are coloured by network or by signal strength.
+- **Roles** from what each device transmits. Coordinator: short address 0x0000,
+  beacons with the PAN coordinator flag. Router: beacons, Link Status, relaying for
+  others, source-route relay. End device: Data Request polls to its parent, the
+  end-device-initiator flag. The details panel lists the evidence behind each role.
+- **IEEE address and vendor** (OUI) of every device that transmits. The NWK security
+  header carries the sender's IEEE address, so this works on encrypted traffic too.
+- **Links.** A unicast MAC frame proves a radio link between its sender and receiver,
+  and a MAC ACK confirms it. Routers lower the NWK radius by one before they rebroadcast,
+  so a relay sent with radius R−1 was heard straight from the originator. That gives
+  links and hop counts to the coordinator. Source routes add inferred (dashed) links.
+- **Per device:** signal and SNR at the HackRF, frequency offset, frames sent and
+  received, NWK frame counter, first and last heard, neighbours.
+- **Channel strip** with the activity on each channel. Click a channel to retune the
+  HackRF, or *Hop all* to cycle through all 16.
+- **Frame log**, filtered to the selected device.
+
+Drag a device to pin it (double-click releases it). Positions survive a reload.
+`--names FILE` labels devices: either a JSON object such as
+`{"00:17:88:01:02:03:04:05": "Kitchen lamp"}` (keys can also be `"0x1a62/0x711f"`,
+PAN/short address), or zigbee2mqtt's `configuration.yaml` or `database.db`. `--pcap`
+saves the frames heard meanwhile. The page is served on 127.0.0.1 only, unless you
+pass `--host`.
+
+The map shows what the radio hears from where the HackRF is. Devices out of its range
+appear only when others address them (drawn hollow). Links between two routers that
+never send each other a unicast frame stay invisible: the neighbour tables in Link
+Status frames are encrypted.
 
 ### Wireshark
 
@@ -213,10 +263,13 @@ counts one device of a neighbouring network:
 | `zbdemod/phy.py` | PHY constants, chip table, MSK patterns, reference modulator |
 | `zbdemod/demod.py` | streaming demodulator: `diff`/`disc` detectors, coherent/`disc` decoders |
 | `zbdemod/mac.py` | FCS, IEEE 802.15.4 MAC and Zigbee NWK/APS header parser |
-| `zbdemod/pcap.py` | PCAP writer (802.15.4 TAP) |
+| `zbdemod/pcap.py` | PCAP writer (802.15.4 TAP), PCAP/PCAPNG reader |
+| `zbdemod/netmap.py` | network model for the map: networks, devices, roles, links |
+| `zbdemod/webmap.py`, `zbdemod/web/` | `map` command: HTTP server, capture loop, browser page |
+| `zbdemod/extcap.py` | Wireshark extcap interface |
 | `zbdemod/hackrf.py` | `ctypes` binding to libhackrf (streaming RX, retuning) |
 | `zbdemod/sim.py` | channel simulator (CFO, phase, clock drift, AWGN, IF offset) |
-| `zbdemod/cli.py` | `live`, `scan`, `record`, `file`, `selftest` commands |
+| `zbdemod/cli.py` | `live`, `scan`, `record`, `file`, `map`, `selftest`, `extcap-install` commands |
 | `examples/` | synthetic IQ recording, its decoded PCAP and the generator script |
 | `tests/` | pytest suite |
 
@@ -236,13 +289,17 @@ The tests need no hardware. They cover:
 - SFD alignment when a detection is forced 1–2 symbols off;
 - an ACK 192 µs after a data frame;
 - no false frames on pure noise;
-- the PCAP layout.
+- the PCAP layout, PCAP/PCAPNG reading, PCAP streaming to stdout and the extcap interface;
+- the network map: ACK matching, roles, parent links, broadcast-relay links and hop counts,
+  source routes, merging a device's IEEE and short-address records, device names, and
+  the web server (API, Host check, tuning).
 
 ## Limitations and ideas
 
 - 2.4 GHz O-QPSK PHY only (channels 11–26). No sub-GHz PHYs, no 802.15.4g/e features
   beyond header parsing.
-- No decryption. Use Wireshark with the network key.
+- No decryption. Use Wireshark with the network key. With the key, the map could also
+  read Link Status neighbour tables (link costs between routers) and device announcements.
 - At −4 dB the detector already finds nearly every frame, but only about half decode,
   so the decoder is the limit again. Coherent reception could in theory go ~3 dB lower.
   Candidates: forward-backward phase smoothing and a decision-directed CFO estimate over
