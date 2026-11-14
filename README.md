@@ -5,11 +5,13 @@ written in Python with only `numpy` and `scipy`.
 
 It demodulates frames in real time, checks the FCS, prints a decoded MAC / Zigbee NWK
 summary of every frame and writes a PCAP that Wireshark dissects down to Zigbee APS/ZCL.
+With your network key it decrypts the frames too:
 
 ```
 01:00:00.002 ch15  -10.4dBFS snr 14.1 cfo  -35.0k lqi 255 len  28  Beacon seq=85 pan=0x1234 0x0000 -> - PAN-coord assoc=yes ZigbeePRO v2 depth=0 router_cap=1 ed_cap=1 epid=dd:dd:dd:dd:dd:dd:dd:dd
-01:00:00.003 ch15  -10.4dBFS snr 14.2 cfo  -35.0k lqi 255 len  49  Data seq=33 pan=0x1234 0x0000 -> 0x0001 [A] NWK Data 0x0000->0x0001 r=30 nseq=7 enc(network key fc=1000 src=02:00:00:00:00:00:00:01 kseq=0)
-01:00:00.006 ch15  -10.4dBFS snr 14.1 cfo  -35.0k lqi 255 len   5  Ack seq=33
+01:00:00.006 ch15  -10.4dBFS snr 14.1 cfo  -35.0k lqi 255 len  71  Data seq=9 pan=0x1234 0x0001 -> 0x0000 [A] NWK Data 0x0001->0x0000 r=30 nseq=4 enc(network key fc=501 src=02:00:00:00:00:00:00:02 kseq=0) | ZCL Basic Read Attributes Response ManufacturerName="ACME" ModelIdentifier="Demo Lamp"
+01:00:00.010 ch15  -10.4dBFS snr 14.2 cfo  -35.0k lqi 255 len   5  Ack seq=9
+01:00:00.011 ch15  -10.4dBFS snr 14.2 cfo  -34.9k lqi 255 len  50  Data seq=10 pan=0x1234 0x0001 -> 0xffff NWK Cmd 0x0001->0xfffc r=1 nseq=5 srcIEEE=02:00:00:00:00:00:00:02 enc(network key fc=502 src=02:00:00:00:00:00:00:02 kseq=0) | Link Status (1 neighbours): 0x0000 in1/out1
 ```
 
 Highlights:
@@ -23,7 +25,10 @@ Highlights:
 - **Wireshark ready.** It writes `LINKTYPE_IEEE802_15_4_TAP` PCAPs with the channel number,
   and offers a live capture interface (extcap) in Wireshark's interface list.
 - **Network map.** `zbdemod map` draws the networks, devices and radio links it hears,
-  live in the browser. It needs no network key.
+  live in the browser. It works without the network key; with yours it also shows the
+  router mesh with link costs, device models and network events.
+- **Decryption** of Zigbee NWK frames with network keys from your own configuration
+  (AES-CCM\*, pure Python).
 - **No GNU Radio.** libhackrf is driven directly through `ctypes`.
 
 ## Installation
@@ -54,6 +59,9 @@ with hardware.
 # try it without hardware: decode the bundled synthetic recording
 zbdemod file examples/synthetic.cs8 --pcap out.pcap
 
+# ... and decrypt it with its made-up example key
+zbdemod file examples/synthetic.cs8 --keys examples/synthetic.key
+
 # find networks: hop over channels 11-26, 5 s each
 zbdemod scan
 
@@ -79,6 +87,7 @@ Common options:
 |---|---|
 | `--pcap FILE` | write frames with a valid FCS to a PCAP file |
 | `--hex` | print frame bytes |
+| `--keys FILE` | decrypt with your network key(s), see below (default: `$ZBDEMOD_KEYS`) |
 | `--bad` | also report (and write) frames with a bad FCS |
 | `--lna N`, `--vga N` | HackRF gains (default 40 / 30 dB, see below) |
 | `--amp` | enable the HackRF +14 dB RF amplifier |
@@ -151,9 +160,55 @@ saves the frames heard meanwhile. The page is served on 127.0.0.1 only, unless y
 pass `--host`.
 
 The map shows what the radio hears from where the HackRF is. Devices out of its range
-appear only when others address them (drawn hollow). Links between two routers that
-never send each other a unicast frame stay invisible: the neighbour tables in Link
-Status frames are encrypted.
+appear only when others address them (drawn hollow). Without the key, links between two
+routers that never send each other a unicast frame stay invisible, because the neighbour
+tables in Link Status frames are encrypted. With `--keys` (next section) they appear.
+
+### Decryption with your network key
+
+```sh
+zbdemod live -c 11 --keys my-network.key
+zbdemod map -c 11 --keys ~/zigbee2mqtt/data/configuration.yaml
+```
+
+`--keys FILE` (or the `ZBDEMOD_KEYS` environment variable holding a path) loads the
+network key(s) of **your** network from a file:
+
+- a text file with one key per line, 32 hex digits (`:`, `-` and spaces are allowed,
+  `#` starts a comment);
+- JSON: `"hex"`, `["hex", ...]`, `{"network_key": "hex"}` or `{"network_key": [16 numbers]}`;
+- zigbee2mqtt's `configuration.yaml`, which keeps the key as `network_key: [1, 3, 5, ...]`.
+
+Several keys can be listed (after a key rotation, for example). A wrong key fails the
+4-byte MIC check, so every key is tried and the one that works is remembered per key
+sequence number. A key copied in reverse byte order is also accepted. The key never
+leaves the machine and is never printed.
+
+NWK frames are decrypted with AES-CCM\* (security level 5), implemented in pure Python
+and checked against the FIPS-197 and RFC 3610 test vectors and against Wireshark's
+decoder. Frame lines then end with the decrypted payload (`| ...`): NWK commands (Link
+Status with link costs, Route Record, Route Request, Network Status, Leave, Rejoin,
+Network Update, End Device Timeout), ZDO (Device Announce, Parent Announce, address,
+node and simple descriptor responses, neighbour and routing tables, permit joining) and
+ZCL (cluster and command names, attribute reads, writes and reports).
+
+In the map the key adds:
+
+- **router-to-router links from Link Status** with the link cost in both directions,
+  coloured from 1 (best) to 7 (worst), even for routers the HackRF cannot hear but whose
+  neighbours it can;
+- **neighbour and routing tables** answered to a coordinator scan (e.g. zigbee2mqtt's
+  network map): end devices with their parents, LQI, next hops;
+- **roles from Device Announce and Node Descriptors**, power source and receiver mode;
+- **manufacturer, model and firmware** from ZCL Basic attributes (device labels default
+  to the model), and the clusters each device serves or controls;
+- **events**: devices announcing, leaving and rejoining, network status errors, permit
+  joining opened or closed, PAN ID updates.
+
+What it does not do, on purpose: it only uses keys you configure. It does not try to
+extract or guess keys, for example from a device joining the network. Payloads that
+are additionally encrypted at the APS layer with a link key stay encrypted (they are
+counted in the network details).
 
 ### Wireshark
 
@@ -263,6 +318,8 @@ counts one device of a neighbouring network:
 | `zbdemod/phy.py` | PHY constants, chip table, MSK patterns, reference modulator |
 | `zbdemod/demod.py` | streaming demodulator: `diff`/`disc` detectors, coherent/`disc` decoders |
 | `zbdemod/mac.py` | FCS, IEEE 802.15.4 MAC and Zigbee NWK/APS header parser |
+| `zbdemod/zcrypto.py` | AES-128 / CCM\* and NWK decryption with configured keys, key file loading |
+| `zbdemod/zdecode.py` | decrypted payloads: NWK commands, APS, ZDO, ZCL |
 | `zbdemod/pcap.py` | PCAP writer (802.15.4 TAP), PCAP/PCAPNG reader |
 | `zbdemod/netmap.py` | network model for the map: networks, devices, roles, links |
 | `zbdemod/webmap.py`, `zbdemod/web/` | `map` command: HTTP server, capture loop, browser page |
@@ -270,7 +327,7 @@ counts one device of a neighbouring network:
 | `zbdemod/hackrf.py` | `ctypes` binding to libhackrf (streaming RX, retuning) |
 | `zbdemod/sim.py` | channel simulator (CFO, phase, clock drift, AWGN, IF offset) |
 | `zbdemod/cli.py` | `live`, `scan`, `record`, `file`, `map`, `selftest`, `extcap-install` commands |
-| `examples/` | synthetic IQ recording, its decoded PCAP and the generator script |
+| `examples/` | synthetic IQ recording (encrypted with the made-up `synthetic.key`), its decoded PCAP and the generator script |
 | `tests/` | pytest suite |
 
 ## Tests
@@ -292,14 +349,17 @@ The tests need no hardware. They cover:
 - the PCAP layout, PCAP/PCAPNG reading, PCAP streaming to stdout and the extcap interface;
 - the network map: ACK matching, roles, parent links, broadcast-relay links and hop counts,
   source routes, merging a device's IEEE and short-address records, device names, and
-  the web server (API, Host check, tuning).
+  the web server (API, Host check, tuning);
+- decryption: AES and CCM against FIPS-197 / RFC 3610 vectors, wrong and reversed keys,
+  key file formats, NWK command / ZDO / ZCL parsing, and Link Status, neighbour tables,
+  Device Announce and Basic attributes in the map.
 
 ## Limitations and ideas
 
 - 2.4 GHz O-QPSK PHY only (channels 11–26). No sub-GHz PHYs, no 802.15.4g/e features
   beyond header parsing.
-- No decryption. Use Wireshark with the network key. With the key, the map could also
-  read Link Status neighbour tables (link costs between routers) and device announcements.
+- Decryption covers the NWK layer with configured network keys only. APS-layer
+  encryption with link keys is not decrypted, and keys are never extracted from traffic.
 - At −4 dB the detector already finds nearly every frame, but only about half decode,
   so the decoder is the limit again. Coherent reception could in theory go ~3 dB lower.
   Candidates: forward-backward phase smoothing and a decision-directed CFO estimate over

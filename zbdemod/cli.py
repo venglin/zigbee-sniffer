@@ -85,7 +85,9 @@ class Printer:
         out=None,
         quiet: bool = False,
         pcap_bad: bool = False,
+        keys=None,
     ):
+        self.keys = keys
         self.show_hex = show_hex
         self.pcap = pcap
         self.zigbee = zigbee
@@ -100,7 +102,7 @@ class Printer:
             ts = time.strftime("%H:%M:%S", time.localtime(wall)) + f".{int((wall % 1) * 1000):03d}"
             ch = f"ch{f.channel}" if f.channel else "    "
             status = "" if f.fcs_ok else " BAD-FCS"
-            desc = mac.parse(f.psdu, self.zigbee).summary() if f.fcs_ok else ""
+            desc = mac.parse(f.psdu, self.zigbee, self.keys).summary() if f.fcs_ok else ""
             print(
                 f"{ts} {ch} {f.rssi_dbfs:6.1f}dBFS snr{f.snr_db:5.1f} cfo{f.cfo_hz / 1e3:+7.1f}k "
                 f"lqi{f.lqi:4d} len{len(f.psdu):4d}{status}  {desc}",
@@ -125,10 +127,21 @@ def open_pcap(path: str | None) -> PcapWriter | None:
     return PcapWriter(open(path, "wb"))
 
 
+def load_keys_arg(args):
+    """KeyRing from --keys (or $ZBDEMOD_KEYS), announced on stderr."""
+    from .zcrypto import load_keyring
+
+    keys = load_keyring(getattr(args, "keys", None))
+    if keys:
+        print(f"# decrypting with {keys.configured} configured network key(s)", file=sys.stderr)
+    return keys
+
+
 def make_printer(args, quiet: bool = False) -> Printer:
+    keys = load_keys_arg(args)
     pcap = open_pcap(args.pcap)
     out = sys.stderr if args.pcap == "-" else sys.stdout
-    return Printer(args.hex, pcap, out=out, quiet=quiet, pcap_bad=args.bad)
+    return Printer(args.hex, pcap, out=out, quiet=quiet, pcap_bad=args.bad, keys=keys)
 
 
 def make_demod(args, channel: int | None, offset: float, fs: float) -> Demodulator:
@@ -430,6 +443,12 @@ def build_parser() -> argparse.ArgumentParser:
             "(e.g. | wireshark -k -i -), frame lines then go to stderr",
         )
         sp.add_argument("--hex", action="store_true", help="print frame bytes")
+        sp.add_argument(
+            "--keys",
+            metavar="FILE",
+            help="decrypt Zigbee NWK frames with your network key(s) from FILE: hex key per line, "
+            "JSON, or zigbee2mqtt configuration.yaml (network_key); default $ZBDEMOD_KEYS",
+        )
         sp.add_argument("--bad", action="store_true", help="also report frames with bad FCS")
         sp.add_argument(
             "--method",

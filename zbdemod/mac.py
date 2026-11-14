@@ -153,8 +153,9 @@ def _addr(r: _Reader, mode: int) -> str | None:
     return None
 
 
-def parse(psdu: bytes, decode_zigbee: bool = True) -> MacFrame:
-    """Parse an MPDU (PSDU including the 2-byte FCS)."""
+def parse(psdu: bytes, decode_zigbee: bool = True, keys=None) -> MacFrame:
+    """Parse an MPDU (PSDU including the 2-byte FCS). With `keys` (a
+    zcrypto.KeyRing), secured Zigbee NWK payloads are decrypted and described."""
     body = psdu[:-2]
     r = _Reader(body)
     try:
@@ -198,7 +199,7 @@ def parse(psdu: bytes, decode_zigbee: bool = True) -> MacFrame:
             cmd = mf.payload[0]
             mf.info.append(MAC_COMMANDS.get(cmd, f"cmd 0x{cmd:02x}"))
         elif ftype == 1 and decode_zigbee and mf.payload:
-            mf.info.append(parse_nwk(mf.payload))
+            mf.info.append(parse_nwk(mf.payload, keys))
     except ValueError as exc:
         mf.error = str(exc)
     return mf
@@ -275,6 +276,8 @@ class NwkFrame:
     frame_counter: int | None = None
     sec_src: str | None = None  # aux header source = the device that sent this hop
     key_seq: int | None = None
+    header_len: int = 0  # offset of the auxiliary security header
+    aux_len: int = 0
     payload: bytes = b""  # ciphertext + MIC when secured
 
     @property
@@ -318,6 +321,7 @@ def decode_nwk(data: bytes) -> NwkFrame | str | None:
         count = r.u8()
         n.relay_index = r.u8()
         n.relays = [r.u16() for _ in range(count)]
+    n.header_len = r.pos
     if fc & 0x0200:
         n.secured = True
         sc = r.u8()
@@ -327,12 +331,14 @@ def decode_nwk(data: bytes) -> NwkFrame | str | None:
             n.sec_src = fmt_ext(r.take(8))
         if n.key_id == 1:
             n.key_seq = r.u8()
+        n.aux_len = r.pos - n.header_len
     n.payload = r.rest()
     return n
 
 
-def parse_nwk(data: bytes) -> str:
-    """One-line summary of a Zigbee NWK frame (and APS header when unencrypted)."""
+def parse_nwk(data: bytes, keys=None) -> str:
+    """One-line summary of a Zigbee NWK frame and its payload (when unencrypted,
+    or decrypted with one of `keys`)."""
     try:
         n = decode_nwk(data)
     except ValueError:
@@ -358,11 +364,18 @@ def parse_nwk(data: bytes) -> str:
         if n.key_seq is not None:
             sec.append(f"kseq={n.key_seq}")
         parts.append(" ".join(sec) + ")")
-        return " ".join(parts)
-    if n.ftype == 1 and n.payload:
-        parts.append(NWK_COMMANDS.get(n.payload[0], f"cmd 0x{n.payload[0]:02x}"))
-    elif n.ftype == 0:
-        parts.append(_parse_aps(n.payload))
+        if not keys:
+            return " ".join(parts)
+        plain = keys.decrypt_nwk(data, n)
+        if plain is None:
+            parts.append("[no key matches]")
+            return " ".join(parts)
+    else:
+        plain = n.payload
+    if plain:
+        from .zdecode import describe
+
+        parts.append(("| " if n.secured else "") + describe(n, plain).summary)
     return " ".join(parts)
 
 

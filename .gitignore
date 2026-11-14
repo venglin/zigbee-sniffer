@@ -15,3 +15,7 @@ captures/
 !examples/synthetic.cs8
 !examples/synthetic.cs8.json
 !examples/synthetic.pcap
+
+# Network key files (keep your keys out of the repository)
+*.key
+!examples/synthetic.key

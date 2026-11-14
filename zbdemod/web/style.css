@@ -195,6 +195,7 @@ select {
 /* graph marks */
 .link { stroke: var(--link); stroke-linecap: round; fill: none; transition: stroke 0.6s, opacity 0.3s; }
 .link.kind-route { stroke-dasharray: 5 4; }
+.link.kind-neighbor { stroke-dasharray: 10 3; }
 .link.kind-parent { stroke-dasharray: 1.5 3.5; }
 .link.flash { stroke: var(--link-hi); transition: none; }
 .link.hi { stroke: var(--link-hi); }

@@ -19,6 +19,13 @@ without the network key:
 * Patterns: a NWK command broadcast to all routers with radius 1 is a Link
   Status (routers only); a frame relayed on behalf of another device comes from
   a router; short address 0x0000 is the coordinator.
+
+With the network key (zcrypto.KeyRing, from the user's configuration) the
+payloads are decrypted too: Link Status neighbour lists with link costs in both
+directions (router-to-router links the radio may never see directly), Route
+Records, Device Announce (role, power source), ZDO neighbour and routing tables,
+Node/Simple descriptors, ZCL Basic attributes (manufacturer, model), Leave,
+Rejoin, Network Status and permit-join events.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import mac
+from . import mac, zdecode
 
 ACK_WINDOW = 0.010  # an ACK follows its frame within ~1 ms; allow timestamp slop
 BROADCAST_WINDOW = 3.0  # relays (with passive-ack retries) follow the original within ~1 s
@@ -155,6 +162,18 @@ class Node:
         self.last_seen = now
         self.last_tx: float | None = None
         self.hops: dict[str, int] = {}  # originator id -> hop count (from broadcast relays)
+        # from decrypted payloads
+        self.manufacturer: str | None = None
+        self.model: str | None = None
+        self.sw_build: str | None = None
+        self.power_source: str | None = None
+        self.mains: bool | None = None
+        self.manufacturer_code: int | None = None
+        self.clusters: set[int] = set()  # server clusters it reports / answers for
+        self.controls: set[int] = set()  # clusters it sends commands to (remotes, switches)
+        self.device_types: set[tuple[int, int]] = set()  # (profile, device id)
+        self.concentrator = False
+        self.left: float | None = None  # time of a Leave without rejoin
 
     @property
     def role(self) -> str:
@@ -170,6 +189,8 @@ class Node:
     def heard(self, wall: float, rssi, snr, cfo_hz, lqi, channel) -> None:
         self.tx += 1
         self.last_tx = wall
+        if self.left is not None and wall > self.left + 1:
+            self.left = None
         self.last_seen = max(self.last_seen, wall)
         if channel is not None:
             self.channel = channel
@@ -195,7 +216,8 @@ class Node:
         self.first_seen = min(self.first_seen, other.first_seen)
         self.last_seen = max(self.last_seen, other.last_seen)
         newer = (other.last_tx or 0) > (self.last_tx or 0)
-        for attr in ("rssi", "snr", "cfo_khz", "lqi", "channel", "depth", "permit_join", "rx_on_when_idle"):
+        for attr in ("rssi", "snr", "cfo_khz", "lqi", "channel", "depth", "permit_join", "rx_on_when_idle",
+                     "manufacturer", "model", "sw_build", "power_source", "mains", "manufacturer_code"):
             if getattr(self, attr) is None or (newer and getattr(other, attr) is not None):
                 setattr(self, attr, getattr(other, attr))
         if other.frame_counter is not None:
@@ -204,6 +226,10 @@ class Node:
             self.last_tx = other.last_tx
         for origin, h in other.hops.items():
             self.hops[origin] = min(h, self.hops.get(origin, h))
+        self.clusters |= other.clusters
+        self.controls |= other.controls
+        self.device_types |= other.device_types
+        self.concentrator = self.concentrator or other.concentrator
         self.ieee = self.ieee or other.ieee
 
 
@@ -218,6 +244,9 @@ class Link:
         self.route = 0  # times seen in a source route (inferred link)
         self.relay = 0  # broadcasts one end relayed straight from the other (radius R-1)
         self.parent: str | None = None  # id of the child when this is an end device's parent link
+        # reporter id -> what that end says about the link (decrypted Link Status:
+        # in/out cost; ZDO neighbour table: lqi, relationship; routing table: next hop)
+        self.reported: dict[str, dict] = {}
         self.first_seen = now
         self.last_seen = now
 
@@ -235,6 +264,9 @@ class Network:
         self.frames = 0
         self.green_power = 0
         self.inter_pan = 0
+        self.decrypted = 0
+        self.mic_failed = 0
+        self.aps_encrypted = 0
         self.first_seen = now
         self.last_seen = now
 
@@ -252,13 +284,25 @@ def _fmt_short(v: int | None) -> str | None:
     return None if v is None else f"0x{v:04x}"
 
 
+def _link_cost(link: "Link") -> int | None:
+    """Link cost (1 best .. 7 worst) from the latest Link Status reports: the worse
+    of the two directions, as Zigbee routing uses it. None when not reported."""
+    costs = []
+    for info in link.reported.values():
+        for name in ("in", "out"):
+            if info.get(name):  # 0 = not known yet
+                costs.append(info[name])
+    return max(costs) if costs else None
+
+
 class NetworkMap:
     """Thread-safe aggregate of everything heard. Feed it with add() / add_frame();
     snapshot() returns a JSON-serialisable view for the web UI."""
 
-    def __init__(self, names: dict[str, str] | None = None, live: bool = True):
+    def __init__(self, names: dict[str, str] | None = None, live: bool = True, keys=None):
         self.names = names or {}
         self.live = live
+        self.keys = keys  # zcrypto.KeyRing with the user's network keys, or None
         self.lock = threading.Lock()
         self.reset()
 
@@ -274,6 +318,7 @@ class NetworkMap:
             self._alias: dict[str, str] = {}
             self._pending_ack: tuple | None = None
             self._bcast: dict[tuple[int, int, int], tuple[int, float]] = {}
+            self._ls_pending: dict[str, set[str]] = {}  # Link Status lists spanning frames
             self.log: deque = deque(maxlen=LOG_LENGTH)
             self.events: deque = deque(maxlen=EVENT_LENGTH)
             self.total = self.bad = self.unattributed = 0
@@ -388,6 +433,8 @@ class NetworkMap:
             target.route += link.route
             target.relay += link.relay
             target.parent = target.parent or (node.id if link.parent == other.id else link.parent)
+            for by, info in link.reported.items():
+                target.reported.setdefault(node.id if by == other.id else by, {}).update(info)
             target.first_seen = min(target.first_seen, link.first_seen)
             target.last_seen = max(target.last_seen, link.last_seen)
         for key in [k for k in self.flows if other.id in k]:
@@ -420,7 +467,7 @@ class NetworkMap:
         if cs:
             cs.frames += 1
             cs.last = wall
-        m = mac.parse(psdu)
+        m = mac.parse(psdu, keys=self.keys)
         self.log.append({"t": wall, "ch": channel, "rssi": tx[0], "text": m.summary()})
         if m.error:
             return
@@ -571,6 +618,181 @@ class NetworkMap:
             flow = self.flows.setdefault((nsrc.id, ndst.id), [0, wall, wall])
             flow[0] += 1
             flow[2] = wall
+        if n.secured:
+            if not self.keys:
+                return
+            src64 = bytes.fromhex(src.ieee.replace(":", ""))[::-1] if src and src.ieee else None
+            plain = self.keys.decrypt_nwk(m.payload, n, src64)
+            if plain is None:
+                net.mic_failed += 1
+                return
+            net.decrypted += 1
+        else:
+            plain = n.payload
+        if plain and nsrc:
+            self._payload(zdecode.describe(n, plain), n, net, src, nsrc, ndst, link, wall)
+
+    # ------------------------------------------------- decrypted payloads
+    def _payload(self, inner, n, net: Network, src, nsrc: Node, ndst, link, wall: float) -> None:
+        d = inner.data
+        pan = net.pan
+        name = _fmt_short(nsrc.short)
+        if inner.kind == "nwk_cmd":
+            cmd = d["cmd"]
+            if cmd == 0x08 and src is nsrc:
+                self._link_status(nsrc, d, pan, wall)
+            elif cmd == 0x05:  # Route Record: originator > relays > concentrator
+                path = [n.src, *d["relays"], n.dst]
+                for r in d["relays"]:
+                    self._node(pan, r, wall).add_role("router", "relay in a Route Record")
+                for a, b in zip(path, path[1:]):
+                    if a != b and a < 0xFFF8 and b < 0xFFF8:
+                        self._link_between(self._node(pan, a, wall), self._node(pan, b, wall), wall).route += 1
+            elif cmd == 0x01 and d["many_to_one"]:
+                nsrc.concentrator = True
+                nsrc.add_role("router", "concentrator (many-to-one route requests)")
+            elif cmd == 0x03:
+                self._event(wall, f"Network status from {name}: {d['status_name']} ({_fmt_short(d['dst'])})", nsrc.id)
+            elif cmd == 0x04:
+                if d["request"]:
+                    who = _fmt_short(ndst.short) if ndst else "its children"
+                    self._event(wall, f"{name} asks {who} to leave", ndst.id if ndst else nsrc.id)
+                else:
+                    nsrc.left = None if d["rejoin"] else wall
+                    self._event(wall, f"{name} leaves the network" + (" (will rejoin)" if d["rejoin"] else ""), nsrc.id)
+            elif cmd == 0x06:
+                self._capability(nsrc, d["capability"], "rejoin request")
+                self._event(wall, f"{name} asks to rejoin", nsrc.id)
+            elif cmd == 0x07 and d["status"] == 0:
+                self._event(wall, f"{n.dst_ieee or _fmt_short(n.dst)} rejoined as {_fmt_short(d['addr'])}")
+            elif cmd == 0x0A:
+                self._event(wall, f"Network update in 0x{pan:04x}: new PAN ID 0x{d['new_pan']:04x}", nsrc.id)
+            elif cmd == 0x0B and src is nsrc:
+                nsrc.add_role("end_device", "End Device Timeout Request to its parent")
+                if link:
+                    link.parent = nsrc.id
+        elif inner.kind == "zdo":
+            self._zdo(d, pan, net, nsrc, wall)
+        elif inner.kind == "zcl":
+            self._zcl(d, nsrc, wall)
+        elif inner.kind == "aps_encrypted":
+            net.aps_encrypted += 1
+
+    def _capability(self, node: Node, cap: dict, source: str) -> None:
+        kind = "router" if cap["router"] else "end_device"
+        node.add_role(kind, f"{source}: {kind.replace('_', ' ')}")
+        node.mains = cap["mains"]
+        node.rx_on_when_idle = cap["rx_on_when_idle"]
+
+    def _link_status(self, reporter: Node, d: dict, pan: int, wall: float) -> None:
+        pending = self._ls_pending.setdefault(reporter.id, set())
+        if d["first"]:
+            pending.clear()
+        for e in d["entries"]:
+            if e["addr"] >= 0xFFF8:
+                continue
+            nb = self._node(pan, e["addr"], wall)
+            nb.add_role("router", "listed as a neighbour in a Link Status (routers only)")
+            link = self._link_between(reporter, nb, wall)
+            link.reported.setdefault(reporter.id, {}).update({"in": e["in"], "out": e["out"], "t": wall})
+            pending.add(nb.id)
+        if d["last"]:  # complete list: forget neighbours this router no longer reports
+            for key in [k for k in self.links if reporter.id in k]:
+                link = self.links[key]
+                other = key[0] if key[1] == reporter.id else key[1]
+                info = link.reported.get(reporter.id)
+                if info and "in" in info and other not in pending:
+                    info.pop("in", None)
+                    info.pop("out", None)
+                    if set(info) <= {"t"}:
+                        del link.reported[reporter.id]
+                    if not (sum(link.frames.values()) or link.relay or link.route or link.parent or link.reported):
+                        del self.links[key]
+            pending.clear()
+
+    def _zdo(self, d: dict, pan: int, net: Network, nsrc: Node, wall: float) -> None:
+        cl = d["cluster"]
+        if cl == 0x0013 and "addr" in d:  # Device_annce
+            dev = self._node(pan, d["addr"], wall)
+            self._learn_ieee(dev, d["ieee"], wall)
+            dev = self._get(dev.id)
+            self._capability(dev, d["capability"], "Device Announce")
+            kind = "router" if d["capability"]["router"] else "end device"
+            power = "mains" if d["capability"]["mains"] else "battery"
+            self._event(wall, f"{_fmt_short(dev.short)} ({d['ieee']}) announced itself: {kind}, {power}", dev.id)
+        elif cl == 0x001F:  # Parent_annce: the sender is the parent of these end devices
+            for ieee in d.get("children", []):
+                child = self._get(self._ieee.get((pan, ieee)))
+                if child and child is not nsrc:
+                    child.add_role("end_device", "child in a Parent Announce")
+                    self._link_between(nsrc, child, wall).parent = child.id
+        elif cl in (0x8000, 0x8001) and "addr" in d:
+            self._learn_ieee(self._node(pan, d["addr"], wall), d["ieee"], wall)
+        elif cl == 0x8002 and d.get("logical_type"):
+            dev = self._node(pan, d["addr"], wall)
+            dev.add_role(d["logical_type"], f"Node Descriptor: {d['logical_type'].replace('_', ' ')}")
+            dev.manufacturer_code = d["manufacturer_code"]
+        elif cl == 0x8004 and "device_id" in d:
+            dev = self._node(pan, d["addr"], wall)
+            dev.device_types.add((d["profile"], d["device_id"]))
+            dev.clusters.update(d["in_clusters"])
+        elif cl == 0x8031:  # Mgmt_Lqi_rsp: neighbour table of the sender
+            for e in d.get("entries", []):
+                if e["addr"] >= 0xFFF8 or e["addr"] == nsrc.short:
+                    continue
+                nb = self._node(pan, e["addr"], wall)
+                self._learn_ieee(nb, e["ieee"], wall)
+                nb = self._get(nb.id)
+                if e["type"] != "unknown":
+                    kind = e["type"].replace("_", " ")
+                    nb.add_role(e["type"], f"neighbour table of {_fmt_short(nsrc.short)}: {kind}")
+                if e["rx_on_when_idle"] is not None:
+                    nb.rx_on_when_idle = e["rx_on_when_idle"]
+                link = self._link_between(nsrc, nb, wall)
+                link.reported.setdefault(nsrc.id, {}).update(
+                    {"lqi": e["lqi"], "relationship": e["relationship"], "t": wall}
+                )
+                if e["relationship"] == "child":
+                    link.parent = nb.id
+                elif e["relationship"] == "parent":
+                    link.parent = nsrc.id
+        elif cl == 0x8032:  # Mgmt_Rtg_rsp: next hops of the sender
+            for rt in d.get("routes", []):
+                if rt["status"] != 0 or rt["next_hop"] >= 0xFFF8 or rt["next_hop"] == nsrc.short:
+                    continue
+                nh = self._node(pan, rt["next_hop"], wall)
+                info = self._link_between(nsrc, nh, wall).reported.setdefault(nsrc.id, {})
+                info["routes"] = info.get("routes", 0) + 1
+                info["t"] = wall
+        elif cl == 0x0036 and "duration" in d:
+            who = _fmt_short(nsrc.short)
+            if d["duration"]:
+                net.permit_join_until = wall + d["duration"]
+                self._event(wall, f"Permit join opened in 0x{pan:04x} for {d['duration']} s by {who}", nsrc.id)
+            else:
+                net.permit_join_until = wall
+                self._event(wall, f"Permit join closed in 0x{pan:04x} by {who}", nsrc.id)
+
+    def _zcl(self, d: dict, nsrc: Node, wall: float) -> None:
+        cluster = d["cluster"]
+        if d["from_server"]:
+            nsrc.clusters.add(cluster)
+        elif d["specific"]:
+            nsrc.controls.add(cluster)
+        if cluster != 0x0000 or not d["attributes"]:
+            return
+        a = d["attributes"]
+        had = nsrc.model
+        for attr, name in ((0x0004, "manufacturer"), (0x0005, "model"), (0x4000, "sw_build")):
+            if isinstance(a.get(attr), str) and a[attr].strip():
+                setattr(nsrc, name, a[attr].strip())
+        if isinstance(a.get(0x0007), int):
+            source = a[0x0007] & 0x7F
+            nsrc.power_source = zdecode.POWER_SOURCES.get(source, f"0x{source:02x}")
+            nsrc.mains = source in (1, 2, 5, 6)
+        if nsrc.model and nsrc.model != had:
+            what = " ".join(x for x in (nsrc.manufacturer, nsrc.model) if x)
+            self._event(wall, f"{_fmt_short(nsrc.short)} is {what}", nsrc.id)
 
     def _broadcast(self, pan: int, n, sender: Node, wall: float) -> None:
         key = (pan, n.src, n.seq)
@@ -622,6 +844,17 @@ class NetworkMap:
                         "depth": n.depth,
                         "frame_counter": n.frame_counter,
                         "hops": n.hops,
+                        "manufacturer": n.manufacturer,
+                        "model": n.model,
+                        "sw_build": n.sw_build,
+                        "power_source": n.power_source,
+                        "mains": n.mains,
+                        "manufacturer_code": n.manufacturer_code,
+                        "clusters": [zdecode.ZCL_CLUSTERS.get(c, f"0x{c:04x}") for c in sorted(n.clusters)],
+                        "controls": [zdecode.ZCL_CLUSTERS.get(c, f"0x{c:04x}") for c in sorted(n.controls)],
+                        "device_types": [f"0x{p:04x}/0x{i:04x}" for p, i in sorted(n.device_types)],
+                        "concentrator": n.concentrator,
+                        "left": n.left,
                         "permit_join": n.permit_join,
                         "rx_on_when_idle": n.rx_on_when_idle,
                         "first_seen": n.first_seen,
@@ -640,7 +873,11 @@ class NetworkMap:
                     "route": l.route,
                     "relay": l.relay,
                     "parent": l.parent,
-                    "kind": "parent" if l.parent else ("radio" if sum(l.frames.values()) or l.relay else "route"),
+                    "reported": [{"by": by, **info} for by, info in l.reported.items()],
+                    "cost": _link_cost(l),
+                    "kind": "parent" if l.parent else (
+                        "radio" if sum(l.frames.values()) or l.relay else "neighbor" if l.reported else "route"
+                    ),
                     "first_seen": l.first_seen,
                     "last_seen": l.last_seen,
                 }
@@ -664,6 +901,9 @@ class NetworkMap:
                         "frames": net.frames,
                         "green_power": net.green_power,
                         "inter_pan": net.inter_pan,
+                        "decrypted": net.decrypted,
+                        "mic_failed": net.mic_failed,
+                        "aps_encrypted": net.aps_encrypted,
                         "coordinator": coord.id if coord else None,
                         "first_seen": net.first_seen,
                         "last_seen": net.last_seen,
@@ -676,6 +916,7 @@ class NetworkMap:
                 "now": now,
                 "live": self.live,
                 "totals": {"frames": self.total, "bad": self.bad, "unattributed": self.unattributed},
+                "decryption": {"keys": self.keys.configured if self.keys else 0},
                 "channels": {
                     str(ch): {
                         "frames": c.frames,

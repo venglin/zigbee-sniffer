@@ -193,7 +193,7 @@ def test_synthetic_example_map():
     assert n["0x0000"]["role"] == "coordinator" and n["0x0000"]["ieee"] == "02:00:00:00:00:00:00:01"
     assert n["0x0001"]["role"] == "router" and n["0x0001"]["ieee"] == "02:00:00:00:00:00:00:02"
     (lk,) = snap["links"]
-    assert lk["acked"] == 1 and lk["ab"] == 1
+    assert lk["acked"] == 2 and (lk["ab"], lk["ba"]) == (1, 1)
     assert snap["channels"]["15"]["beacon_requests"] == 1
     json.dumps(snap)  # serialisable
 
@@ -345,10 +345,10 @@ def test_map_command_serves_a_pcap():
         snap = {}
         while time.time() < deadline:
             snap = json.loads(_request(port, "GET", "/api/state")[2])
-            if snap["totals"]["frames"] == 5:
+            if snap["totals"]["frames"] == 7:
                 break
             time.sleep(0.2)
-        assert snap["totals"]["frames"] == 5 and snap["networks"][0]["pan"] == 0x1234
+        assert snap["totals"]["frames"] == 7 and snap["networks"][0]["pan"] == 0x1234
     finally:
         proc.terminate()
         proc.wait(10)

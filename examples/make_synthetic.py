@@ -1,9 +1,11 @@
 """Generate examples/synthetic.cs8 (+ .json sidecar): a short, fully synthetic
 HackRF-style recording (int8 IQ, 8 Msps, LO 2 MHz above channel 15) with a few
-typical Zigbee frames. All addresses and keys are made up.
+typical Zigbee frames. All addresses are made up, and the NWK frames are
+encrypted with the made-up network key in examples/synthetic.key.
 
     python examples/make_synthetic.py
     python -m zbdemod file examples/synthetic.cs8 --pcap examples/synthetic.pcap
+    python -m zbdemod file examples/synthetic.cs8 --keys examples/synthetic.key
 """
 
 from __future__ import annotations
@@ -17,7 +19,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from zbdemod import mac, sim  # noqa: E402
+from zbdemod.zcrypto import encrypt_nwk, load_keys  # noqa: E402
 
+HERE = Path(__file__).resolve().parent
+KEY = load_keys(HERE / "synthetic.key")[0]
 PAN = 0x1234
 EPID = bytes.fromhex("dd dd dd dd dd dd dd dd".replace(" ", ""))
 COORD_EXT = bytes.fromhex("0200000000000001")[::-1]  # shown as 02:00:00:00:00:00:00:01
@@ -36,11 +41,20 @@ def zigbee_beacon(seq: int) -> bytes:
 
 
 def nwk_secured(frame_type: int, dst: int, src: int, radius: int, nseq: int, counter: int,
-                src_ext: bytes, body_len: int, rng, extra_fc: int = 0, ieee: bytes = b"") -> bytes:
+                src_ext: bytes, payload: bytes, extra_fc: int = 0, ieee: bytes = b"") -> bytes:
     fc = frame_type | (2 << 2) | 0x0200 | extra_fc  # protocol v2, security
-    nwk = struct.pack("<HHHBB", fc, dst, src, radius, nseq) + ieee
-    aux = bytes([0x28]) + struct.pack("<I", counter) + src_ext + b"\x00"  # network key, ext. nonce
-    return nwk + aux + rng.integers(0, 256, body_len + 4, dtype=np.uint8).tobytes()
+    header = struct.pack("<HHHBB", fc, dst, src, radius, nseq) + ieee
+    aux = bytes([0x28]) + struct.pack("<I", counter) + src_ext + b"\x00"  # network key, ext. nonce, kseq 0
+    return encrypt_nwk(KEY, header, aux, payload)
+
+
+def aps_zcl(cluster: int, counter: int, zcl: bytes) -> bytes:
+    """APS unicast data frame, Home Automation profile, endpoint 1 -> 1."""
+    return struct.pack("<BBHHBB", 0x00, 1, cluster, 0x0104, 1, counter) + zcl
+
+
+def zcl_string(attr: int, text: str) -> bytes:
+    return struct.pack("<HBBB", attr, 0, 0x42, len(text)) + text.encode()
 
 
 def data_frame(seq: int, dst: int, src: int, nwk: bytes, ack: bool = True) -> bytes:
@@ -53,14 +67,19 @@ def ack(seq: int) -> bytes:
 
 
 def main() -> None:
-    rng = np.random.default_rng(2024)
+    read_basic = aps_zcl(0x0000, 0x10, bytes([0x00, 0x01, 0x00]) + struct.pack("<HH", 0x0004, 0x0005))
+    basic_rsp = aps_zcl(0x0000, 0x42, bytes([0x18, 0x01, 0x01])
+                        + zcl_string(0x0004, "ACME") + zcl_string(0x0005, "Demo Lamp"))
+    link_status = bytes([0x08, 0x61, 0x00, 0x00, 0x11])  # first+last, 1 entry: 0x0000 in 1, out 1
     frames = [
         beacon_request(0x10),
         zigbee_beacon(0x55),
-        data_frame(0x21, 0x0001, 0x0000, nwk_secured(0, 0x0001, 0x0000, 30, 7, 1000, COORD_EXT, 12, rng)),
+        data_frame(0x21, 0x0001, 0x0000, nwk_secured(0, 0x0001, 0x0000, 30, 7, 1000, COORD_EXT, read_basic)),
         ack(0x21),
-        data_frame(0x08, 0xFFFF, 0x0001,
-                   nwk_secured(1, 0xFFFC, 0x0001, 1, 3, 500, ROUTER_EXT, 9, rng, 0x1000, ROUTER_EXT),
+        data_frame(0x09, 0x0000, 0x0001, nwk_secured(0, 0x0000, 0x0001, 30, 4, 501, ROUTER_EXT, basic_rsp)),
+        ack(0x09),
+        data_frame(0x0A, 0xFFFF, 0x0001,
+                   nwk_secured(1, 0xFFFC, 0x0001, 1, 5, 502, ROUTER_EXT, link_status, 0x1000, ROUTER_EXT),
                    ack=False),
     ]
     fs = 8e6
@@ -70,7 +89,7 @@ def main() -> None:
     iq = np.empty(2 * len(x), dtype=np.int8)
     iq[0::2] = np.clip(np.round(x.real * 127), -128, 127)
     iq[1::2] = np.clip(np.round(x.imag * 127), -128, 127)
-    out = Path(__file__).resolve().parent / "synthetic.cs8"
+    out = HERE / "synthetic.cs8"
     iq.tofile(out)
     meta = {"format": "cs8", "sample_rate": fs, "channel": 15, "offset_hz": 2e6,
             "lo_freq": 2425e6 + 2e6, "start_time": 1767225600.0, "synthetic": True}

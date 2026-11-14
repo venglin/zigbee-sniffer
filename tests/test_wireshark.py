@@ -34,7 +34,7 @@ def test_pcap_to_stdout_streams_valid_pcap():
     )
     assert res.returncode == 0, res.stderr
     linktype, packets = pcap_records(res.stdout)
-    assert linktype == 283 and len(packets) == 5
+    assert linktype == 283 and len(packets) == 7
     # Human-readable frame lines must not pollute the PCAP stream.
     assert b"Beacon Request" in res.stderr
 
@@ -72,7 +72,7 @@ def test_extcap_capture_from_recording(tmp_path):
     )
     assert rc == 0
     linktype, packets = pcap_records(fifo.read_bytes())
-    assert linktype == 283 and len(packets) == 5
+    assert linktype == 283 and len(packets) == 7
 
 
 def test_extcap_install_and_uninstall(tmp_path, capsys):

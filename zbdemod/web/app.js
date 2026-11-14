@@ -6,7 +6,7 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const ROLE_RANK = { coordinator: 3, router: 2, end_device: 1, unknown: 0 };
 const ROLE_NAME = { coordinator: "Coordinator", router: "Router", end_device: "End device", unknown: "Role unknown" };
 const RADIUS = { coordinator: 11, router: 8, end_device: 5, unknown: 6.5 };
-const LINK_LEN = { radio: 95, parent: 45, route: 120 };
+const LINK_LEN = { radio: 95, neighbor: 105, parent: 45, route: 120 };
 const SLOTS = 8;
 
 const store = {
@@ -22,7 +22,7 @@ const store = {
 };
 
 const prefs = Object.assign(
-  { colorBy: "network", labelBy: "name", staleAfter: 300, showRoutes: true, showFlows: false,
+  { colorBy: "network", linkColor: "cost", labelBy: "name", staleAfter: 300, showRoutes: true, showFlows: false,
     hideStale: false, logOpen: true, dwell: 5 },
   store.get("prefs", {}),
 );
@@ -67,7 +67,8 @@ const fmt = (v, digits = 1, unit = "") => (v == null ? "—" : `${v.toFixed(digi
 const panHex = (pan) => "0x" + pan.toString(16).padStart(4, "0");
 const mhz = (ch) => 2405 + 5 * (ch - 11);
 
-function nodeTitle(d) { return d.name || d.short || d.ieee; }
+function nodeTitle(d) { return d.name || d.model || d.short || d.ieee; }
+const clip = (s, n = 22) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s);
 const shortIeee = (ieee) => (ieee ? ieee.slice(0, 5) + "…" + ieee.slice(-5) : ieee);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function labelFor(d) {
@@ -76,7 +77,7 @@ function labelFor(d) {
     case "ieee": return d.ieee || d.short;
     case "vendor": return d.vendor || d.short || shortIeee(d.ieee);
     case "none": return "";
-    default: return d.name || d.short || shortIeee(d.ieee);
+    default: return clip(d.name || d.model) || d.short || shortIeee(d.ieee);
   }
 }
 function slotVar(pan) {
@@ -88,6 +89,10 @@ function signalVar(d) {
   const [lo, hi] = S.rssiRange;
   const f = hi > lo ? (d.rssi - lo) / (hi - lo) : 1;
   return `var(--q${1 + Math.min(4, Math.floor(f * 5))})`;
+}
+// Link cost 1 (best) .. 7 (worst) on the sequential ramp: better = stronger.
+function costVar(cost) {
+  return `var(--q${cost <= 1 ? 5 : cost === 2 ? 4 : cost === 3 ? 3 : cost <= 5 ? 2 : 1})`;
 }
 const nodeColor = (d) => (prefs.colorBy === "signal" ? signalVar(d) : slotVar(d.pan));
 function isStale(t) { return prefs.staleAfter > 0 && t != null && nowS() - t > prefs.staleAfter; }
@@ -526,6 +531,7 @@ function hideTip() { $("tooltip").hidden = true; }
 function nodeTip(d) {
   const lines = [`<div class="t">${esc(nodeTitle(d))}</div>`];
   lines.push(`<div>${ROLE_NAME[d.role]} · PAN ${panHex(d.pan)}${d.vendor ? " · " + esc(d.vendor) : ""}</div>`);
+  if (d.model && d.name) lines.push(`<div>${esc([d.manufacturer, d.model].filter(Boolean).join(" "))}</div>`);
   if (d.heard) {
     const sig = d.rssi != null ? fmt(d.rssi, 1, " dBFS") + " · " : "";
     lines.push(`<div>${sig}${plural(d.tx, "frame")} heard · last ${ago(d.last_tx)}</div>`);
@@ -552,6 +558,16 @@ function linkTip(l) {
     out.push(`<div>${plural(d.relay, "broadcast")} relayed straight from one to the other (radius − 1)</div>`);
   }
   if (d.route) out.push(`<div>In ${d.route} source-routed frames${d.ab || d.ba || d.relay ? "" : " (link inferred, not heard)"}</div>`);
+  for (const r of d.reported || []) {
+    const by = S.nodes.get(r.by)?.data;
+    const who = by ? esc(nodeTitle(by)) : r.by;
+    const parts = [];
+    if (r.in != null) parts.push(`incoming cost ${r.in}, outgoing ${r.out || "?"}`);
+    if (r.lqi != null) parts.push(`LQI ${r.lqi}${r.relationship && r.relationship !== "none" ? ", " + r.relationship : ""}`);
+    if (r.routes) parts.push(`next hop for ${plural(r.routes, "route")}`);
+    if (parts.length) out.push(`<div>${who} reports: ${parts.join(" · ")}</div>`);
+  }
+  if (d.cost != null) out.push(`<div>Link cost ${d.cost} (1 best … 7 worst)</div>`);
   out.push(`<div>Last seen ${ago(d.last_seen)}</div>`);
   return out.join("");
 }
@@ -620,6 +636,9 @@ function styleLink(l) {
   if (isStale(d.last_seen)) cls.push("stale");
   if (l.el.classList.contains("flash")) cls.push("flash");
   l.el.setAttribute("class", cls.join(" "));
+  const byCost = prefs.linkColor === "cost" && d.cost != null;
+  l.el.style.stroke = byCost ? costVar(d.cost) : "";
+  if (byCost && cls.includes("hi")) l.el.setAttribute("stroke-width", (w + 1.2).toFixed(2));
 }
 
 // ------------------------------------------------------------ panels
@@ -747,7 +766,10 @@ function renderNetworks() {
     if (roles.router) parts.push(`${roles.router} router${roles.router === 1 ? "" : "s"}`);
     if (roles.end_device) parts.push(`${roles.end_device} end device${roles.end_device === 1 ? "" : "s"}`);
     const badges = [];
-    if (net.security) badges.push(`<span class="badge">encrypted (NWK key)</span>`);
+    const keys = S.snap.decryption?.keys;
+    if (net.security && keys && net.decrypted) badges.push(`<span class="badge good">decrypted</span>`);
+    else if (net.security && keys && net.mic_failed) badges.push(`<span class="badge warn">key does not match</span>`);
+    else if (net.security) badges.push(`<span class="badge">encrypted (NWK key)</span>`);
     else if (net.security === false) badges.push(`<span class="badge">unencrypted</span>`);
     if (net.permit_join) badges.push(`<span class="badge warn">permit join open</span>`);
     if (!net.zigbee && net.inter_pan) badges.push(`<span class="badge">Inter-PAN only</span>`);
@@ -786,6 +808,7 @@ function renderLegend() {
     [legendLine("kind-radio"), "Radio link (heard)"],
     [legendLine("kind-parent"), "End device ↔ parent"],
   ];
+  if (S.snap?.decryption?.keys) items.push([legendLine("kind-neighbor"), "Neighbours reported by a router"]);
   if (prefs.showRoutes) items.push([legendLine("kind-route"), "Inferred from a source route"]);
   if (prefs.showFlows) {
     items.push([`<svg width="28" height="12" viewBox="0 0 28 12"><path class="flow" d="M2,6 L22,6" marker-end="url(#arrow)"/></svg>`, "End-to-end traffic"]);
@@ -798,6 +821,11 @@ function renderLegend() {
       <div class="ramp-labels num"><span>${fmt(lo, 0)}</span><span>${fmt(hi, 0)}</span></div>`;
   } else {
     html += `<div class="note" style="margin-top:6px">Colour = network (see the list above). Size and shape = role.</div>`;
+  }
+  if (prefs.linkColor === "cost" && S.links.some((l) => l.data.cost != null)) {
+    html += `<div style="margin-top:6px">Link cost from Link Status</div>
+      <div class="ramp">${[7, 5, 3, 2, 1].map((c) => `<span style="background:${costVar(c)}"></span>`).join("")}</div>
+      <div class="ramp-labels num"><span>7 worst</span><span>1 best</span></div>`;
   }
   html += `<div class="note">Faded: silent for longer than the “Fade after” time. Drag to pin, double-click to release.</div>`;
   $("legend").innerHTML = html;
@@ -834,7 +862,9 @@ function renderDetails() {
   const ev = [...snap.events].reverse().slice(0, 40);
   box.innerHTML = `<h2 style="margin-top:2px">Recent events</h2>
     ${ev.length ? `<ul class="events">${ev.map((e) => `<li>${e.node ? `<button class="linkish" data-node="${esc(e.node)}">${esc(e.text)}</button>` : esc(e.text)}<time>${clock(e.t)} · ${ago(e.t)}</time></li>`).join("")}</ul>` : `<p class="empty">Nothing yet.</p>`}
-    <p class="note" style="margin-top:14px">Click a device or a network for details. Everything here comes from unencrypted headers: no network key needed.</p>`;
+    <p class="note" style="margin-top:14px">Click a device or a network for details. ${snap.decryption?.keys
+      ? "Frames are decrypted with your network key: router neighbour tables, link costs, device announcements and ZCL Basic attributes are included."
+      : "Everything here comes from unencrypted headers. Start with --keys FILE to decrypt with your own network key."}</p>`;
 }
 
 function nodeDetails(d) {
@@ -848,9 +878,10 @@ function nodeDetails(d) {
     .filter((l) => l.data.a === d.id || l.data.b === d.id)
     .map((l) => {
       const other = byId.get(l.data.a === d.id ? l.data.b : l.data.a);
-      const kind = l.data.parent ? (l.data.parent === d.id ? "parent" : "child") : l.data.kind === "route" ? "inferred" : "radio";
+      const KIND = { route: "inferred", neighbor: "neighbour", radio: "radio" };
+      const kind = l.data.parent ? (l.data.parent === d.id ? "child" : "parent") : KIND[l.data.kind] || l.data.kind;
       const mine = l.data.a === d.id ? l.data.ab : l.data.ba, theirs = l.data.a === d.id ? l.data.ba : l.data.ab;
-      return { other, kind, mine, theirs, relay: l.data.relay, last: l.data.last_seen };
+      return { other, kind, mine, theirs, relay: l.data.relay, cost: l.data.cost, last: l.data.last_seen };
     })
     .filter((x) => x.other)
     .sort((a, b) => ROLE_RANK[b.other.role] - ROLE_RANK[a.other.role] || b.mine + b.theirs - a.mine - a.theirs);
@@ -865,6 +896,14 @@ function nodeDetails(d) {
       ["IEEE address", d.ieee ? `<span class="mono">${d.ieee}</span>` : "not seen yet"],
       ["Vendor (OUI)", d.vendor ? esc(d.vendor) : d.ieee ? `unknown (<span class="mono">${d.ieee.slice(0, 8)}</span>)` : null],
       ["Name", d.name ? esc(d.name) : null],
+      ["Manufacturer", d.manufacturer ? esc(d.manufacturer) : d.manufacturer_code != null ? `code 0x${d.manufacturer_code.toString(16).padStart(4, "0")}` : null],
+      ["Model", d.model ? esc(d.model) : null],
+      ["Firmware", d.sw_build ? esc(d.sw_build) : null],
+      ["Power", d.power_source ? esc(d.power_source) : d.mains == null ? null : d.mains ? "mains" : "battery"],
+      ["Clusters", d.clusters?.length ? esc(d.clusters.join(", ")) : null],
+      ["Controls", d.controls?.length ? esc(d.controls.join(", ")) : null],
+      ["Concentrator", d.concentrator ? "yes (many-to-one routing)" : null],
+      ["Left network", d.left ? `${clock(d.left)} · ${ago(d.left)}` : null],
       ["Hops", hops.length ? hops.join(", ") : null],
       ["Beacon depth", d.depth],
       ["Channel", d.channel],
@@ -881,9 +920,9 @@ function nodeDetails(d) {
     <h2>Why this role</h2>
     ${ev.length ? `<ul class="evidence">${ev.map((e) => `<li>${esc(e.reason)}</li>`).join("")}</ul>` : `<p class="empty">No evidence yet: the device has not sent a frame that reveals its role.</p>`}
     <h2>Neighbours (${neighbours.length})</h2>
-    ${neighbours.length ? `<table class="tbl"><thead><tr><th>Device</th><th>Link</th><th class="r">Frames</th></tr></thead><tbody>
+    ${neighbours.length ? `<table class="tbl"><thead><tr><th>Device</th><th>Link</th><th class="r">Cost</th><th class="r">Frames</th></tr></thead><tbody>
       ${neighbours.map((x) => `<tr data-node="${esc(x.other.id)}"><td>${esc(nodeTitle(x.other))}<div class="note">${ROLE_NAME[x.other.role]}</div></td>
-        <td>${x.kind}${x.relay ? ` · ${plural(x.relay, "relay")}` : ""}</td><td class="r">${x.mine} → / ${x.theirs} ←</td></tr>`).join("")}
+        <td>${x.kind}${x.relay ? ` · ${plural(x.relay, "relay")}` : ""}</td><td class="r">${x.cost ?? "—"}</td><td class="r">${x.mine} → / ${x.theirs} ←</td></tr>`).join("")}
       </tbody></table>` : `<p class="empty">No links seen yet.</p>`}`;
 }
 
@@ -904,6 +943,8 @@ function networkDetails(net) {
       ["Extended PAN ID", net.epid ? `<span class="mono">${net.epid}</span>` : "not seen (needs a beacon)"],
       ["Stack profile", net.stack_profile],
       ["Security", net.security ? `NWK encryption, key sequence ${net.key_seq ?? "?"}` : net.security === false ? "none seen" : null],
+      ["Decryption", !net.security ? null : !S.snap.decryption?.keys ? "no key configured (--keys)"
+        : `${net.decrypted.toLocaleString()} frames decrypted${net.mic_failed ? `, ${net.mic_failed.toLocaleString()} did not match any key` : ""}${net.aps_encrypted ? `, ${net.aps_encrypted} APS-encrypted (link key, not decrypted)` : ""}`],
       ["Permit join", net.permit_join ? "open (seen in a beacon)" : null],
       ["Devices", `${net.nodes}${roleText ? " · " + roleText : ""}`],
       ["Frames", net.frames.toLocaleString()],
@@ -914,7 +955,7 @@ function networkDetails(net) {
     ])}
     <h2>Devices</h2>
     <table class="tbl"><thead><tr><th>Device</th><th>Role</th><th class="r">Signal</th><th class="r">Last heard</th></tr></thead><tbody>
-      ${devices.map((d) => `<tr data-node="${esc(d.id)}"><td>${esc(nodeTitle(d))}${d.vendor ? `<div class="note">${esc(d.vendor)}</div>` : ""}</td>
+      ${devices.map((d) => `<tr data-node="${esc(d.id)}"><td>${esc(nodeTitle(d))}${d.model || d.vendor ? `<div class="note">${esc(d.model && d.name ? d.model : d.manufacturer || d.vendor || "")}</div>` : ""}</td>
         <td>${ROLE_NAME[d.role]}</td><td class="r">${d.heard ? fmt(d.rssi, 0) : "—"}</td><td class="r">${d.last_tx ? ago(d.last_tx).replace(" ago", "") : "—"}</td></tr>`).join("")}
     </tbody></table>`;
 }
@@ -969,6 +1010,7 @@ function setupControls() {
     });
   };
   bind("colorBy", "colorBy");
+  bind("linkColor", "linkColor");
   bind("labelBy", "labelBy");
   bind("staleAfter", "staleAfter", Number);
   bind("showRoutes", "showRoutes");

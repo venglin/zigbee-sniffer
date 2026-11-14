@@ -200,6 +200,7 @@ class MapSink(cli.Printer):
             out=sys.stderr if args.pcap == "-" else None,
             quiet=not args.verbose,
             pcap_bad=args.bad,
+            keys=model.keys,
         )
         self.model = model
 
@@ -303,7 +304,7 @@ def main(args) -> int:
         print(f"# {len(names)} device names from {args.names}", file=sys.stderr)
     args.channel_list = cli.parse_channels(args.channels) if args.channels else None
     channels = args.channel_list or [11]
-    model = NetworkMap(names=names, live=live)
+    model = NetworkMap(names=names, live=live, keys=cli.load_keys_arg(args))
     ctl = Control("live" if live else ("pcap" if args.read and not args.file else "file"), channels, args.dwell)
     srv = start_server(model, ctl, args.host, args.port)
     host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0", "::", "") else args.host
