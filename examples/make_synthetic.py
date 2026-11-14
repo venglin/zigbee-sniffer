@@ -1,0 +1,82 @@
+"""Generate examples/synthetic.cs8 (+ .json sidecar): a short, fully synthetic
+HackRF-style recording (int8 IQ, 8 Msps, LO 2 MHz above channel 15) with a few
+typical Zigbee frames. All addresses and keys are made up.
+
+    python examples/make_synthetic.py
+    python -m zbdemod file examples/synthetic.cs8 --pcap examples/synthetic.pcap
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from zbdemod import mac, sim  # noqa: E402
+
+PAN = 0x1234
+EPID = bytes.fromhex("dd dd dd dd dd dd dd dd".replace(" ", ""))
+COORD_EXT = bytes.fromhex("0200000000000001")[::-1]  # shown as 02:00:00:00:00:00:00:01
+ROUTER_EXT = bytes.fromhex("0200000000000002")[::-1]
+
+
+def beacon_request(seq: int) -> bytes:
+    return mac.add_fcs(bytes([0x03, 0x08, seq, 0xFF, 0xFF, 0xFF, 0xFF, 0x07]))
+
+
+def zigbee_beacon(seq: int) -> bytes:
+    hdr = bytes([0x00, 0x80, seq]) + struct.pack("<HH", PAN, 0x0000)
+    superframe = struct.pack("<H", 0xCFFF)  # BO=SO=15, PAN coordinator, association permitted
+    payload = bytes([0x00, 0x22, 0x84]) + EPID + b"\xff\xff\xff" + b"\x00"
+    return mac.add_fcs(hdr + superframe + b"\x00\x00" + payload)
+
+
+def nwk_secured(frame_type: int, dst: int, src: int, radius: int, nseq: int, counter: int,
+                src_ext: bytes, body_len: int, rng, extra_fc: int = 0, ieee: bytes = b"") -> bytes:
+    fc = frame_type | (2 << 2) | 0x0200 | extra_fc  # protocol v2, security
+    nwk = struct.pack("<HHHBB", fc, dst, src, radius, nseq) + ieee
+    aux = bytes([0x28]) + struct.pack("<I", counter) + src_ext + b"\x00"  # network key, ext. nonce
+    return nwk + aux + rng.integers(0, 256, body_len + 4, dtype=np.uint8).tobytes()
+
+
+def data_frame(seq: int, dst: int, src: int, nwk: bytes, ack: bool = True) -> bytes:
+    fc = 0x8841 | (0x0020 if ack else 0)  # data, PAN compression, short/short
+    return mac.add_fcs(struct.pack("<HBHHH", fc, seq, PAN, dst, src) + nwk)
+
+
+def ack(seq: int) -> bytes:
+    return mac.add_fcs(bytes([0x02, 0x00, seq]))
+
+
+def main() -> None:
+    rng = np.random.default_rng(2024)
+    frames = [
+        beacon_request(0x10),
+        zigbee_beacon(0x55),
+        data_frame(0x21, 0x0001, 0x0000, nwk_secured(0, 0x0001, 0x0000, 30, 7, 1000, COORD_EXT, 12, rng)),
+        ack(0x21),
+        data_frame(0x08, 0xFFFF, 0x0001,
+                   nwk_secured(1, 0xFFFC, 0x0001, 1, 3, 500, ROUTER_EXT, 9, rng, 0x1000, ROUTER_EXT),
+                   ack=False),
+    ]
+    fs = 8e6
+    # The ACK follows its data frame after the 802.15.4 turnaround (12 symbols = 192 us).
+    x, _ = sim.make_stream(frames, fs=fs, snr_db=15, cfo_hz=-35e3, drift_ppm=25, if_hz=-2e6,
+                           gap_s=(192e-6, 1.5e-3), seed=7)
+    iq = np.empty(2 * len(x), dtype=np.int8)
+    iq[0::2] = np.clip(np.round(x.real * 127), -128, 127)
+    iq[1::2] = np.clip(np.round(x.imag * 127), -128, 127)
+    out = Path(__file__).resolve().parent / "synthetic.cs8"
+    iq.tofile(out)
+    meta = {"format": "cs8", "sample_rate": fs, "channel": 15, "offset_hz": 2e6,
+            "lo_freq": 2425e6 + 2e6, "start_time": 1767225600.0, "synthetic": True}
+    out.with_suffix(".cs8.json").write_text(json.dumps(meta, indent=2) + "\n")
+    print(f"wrote {out} ({len(iq) / 1e3:.0f} kB, {len(x) / fs * 1e3:.1f} ms, {len(frames)} frames)")
+
+
+if __name__ == "__main__":
+    main()

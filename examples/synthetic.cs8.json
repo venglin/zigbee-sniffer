@@ -1,0 +1,9 @@
+{
+  "format": "cs8",
+  "sample_rate": 8000000.0,
+  "channel": 15,
+  "offset_hz": 2000000.0,
+  "lo_freq": 2427000000.0,
+  "start_time": 1767225600.0,
+  "synthetic": true
+}

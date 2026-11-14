@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Recordings and captures (large, and may contain data about real networks).
+# Only the synthetic example is versioned.
+captures/
+*.cs8
+*.cs8.json
+*.cf32
+*.pcap
+!examples/synthetic.cs8
+!examples/synthetic.cs8.json
+!examples/synthetic.pcap

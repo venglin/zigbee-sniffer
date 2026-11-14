@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.cs8 binary
+*.cf32 binary
+*.pcap binary
