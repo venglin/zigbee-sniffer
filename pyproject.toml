@@ -32,6 +32,7 @@ Issues = "https://github.com/venglin/zigbee-sniffer/issues"
 
 [project.scripts]
 zbdemod = "zbdemod.cli:main"
+zbdemod-extcap = "zbdemod.extcap:main"
 
 [tool.setuptools]
 packages = ["zbdemod"]

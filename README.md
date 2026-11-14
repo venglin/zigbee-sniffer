@@ -86,6 +86,25 @@ noise floor, carrier offset of the transmitter relative to the HackRF, an approx
 derived from chip errors, PSDU length, then the decoded frame. MAC flags: `S` security,
 `P` frame pending, `A` ACK requested.
 
+### Live capture in Wireshark
+
+Install the extcap interface once:
+
+```sh
+zbdemod extcap-install            # remove with: zbdemod extcap-install --uninstall
+```
+
+Wireshark then lists **Zigbee / IEEE 802.15.4 (HackRF One)** as a capture interface.
+Its options (the gear icon) set the channel, gains, decoder and detection threshold,
+or select a recording instead of the HackRF. Frames appear live. The interface also
+works from tshark, e.g. `tshark -i zbdemod -o extcap.zbdemod.channel:15`.
+
+Without extcap, stream PCAP through a pipe instead. Frame lines then go to stderr:
+
+```sh
+zbdemod live -c 15 --pcap - | wireshark -k -i -
+```
+
 ### Wireshark
 
 PCAPs use `LINKTYPE_IEEE802_15_4_TAP` (283) with FCS-type and channel TLVs. Wireshark

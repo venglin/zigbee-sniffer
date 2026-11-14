@@ -1,19 +1,21 @@
 """Command line front end.
 
     python -m zbdemod live   -c 15 [--pcap out.pcap]      live decoding
+    python -m zbdemod live   -c 15 --pcap - | wireshark -k -i -    live into Wireshark
     python -m zbdemod scan   [-c 11-26] [--dwell 5]        hop channels, find networks
     python -m zbdemod record -c 15 -d 10 -o cap.cs8        save raw IQ (+ .json sidecar)
     python -m zbdemod file   cap.cs8 [--pcap out.pcap]     decode a recording
     python -m zbdemod selftest                             synthetic end-to-end test
+    python -m zbdemod extcap-install                       add the Wireshark capture interface
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -47,36 +49,85 @@ def int8_to_complex(raw: bytes | np.ndarray) -> np.ndarray:
     return (a.astype(np.float32) * (1 / 128)).view(np.complex64)
 
 
+class PipeClosed(Exception):
+    """The PCAP consumer (Wireshark, tshark, a pipe) went away."""
+
+
+def release_dead_stdout() -> None:
+    """After the reader of a '--pcap -' stream went away, point stdout at the null
+    device so Python does not complain about flushing the dead pipe at exit."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+
+
+def _pipe_closed(printer: "Printer", verbose: bool = True) -> None:
+    if verbose:
+        print("# PCAP output closed by the reader", file=sys.stderr)
+    if printer.pcap is not None and printer.pcap.f is getattr(sys.stdout, "buffer", None):
+        release_dead_stdout()
+
+
 class Printer:
-    def __init__(self, show_hex: bool, pcap: PcapWriter | None, zigbee: bool = True):
+    """Prints a summary line per frame and writes frames to the PCAP (if any).
+
+    out:   text stream for frame lines (stderr when the PCAP goes to stdout)
+    quiet: no text output at all (Wireshark extcap mode)
+    """
+
+    def __init__(
+        self,
+        show_hex: bool,
+        pcap: PcapWriter | None,
+        zigbee: bool = True,
+        out=None,
+        quiet: bool = False,
+        pcap_bad: bool = False,
+    ):
         self.show_hex = show_hex
         self.pcap = pcap
         self.zigbee = zigbee
+        self.out = out or sys.stdout
+        self.quiet = quiet
+        self.pcap_bad = pcap_bad
         self.count = 0
 
     def frame(self, f: Frame, wall: float) -> None:
         self.count += 1
-        ts = time.strftime("%H:%M:%S", time.localtime(wall)) + f".{int((wall % 1) * 1000):03d}"
-        ch = f"ch{f.channel}" if f.channel else "    "
-        status = "" if f.fcs_ok else " BAD-FCS"
-        desc = mac.parse(f.psdu, self.zigbee).summary() if f.fcs_ok else ""
-        print(
-            f"{ts} {ch} {f.rssi_dbfs:6.1f}dBFS snr{f.snr_db:5.1f} cfo{f.cfo_hz / 1e3:+7.1f}k "
-            f"lqi{f.lqi:4d} len{len(f.psdu):4d}{status}  {desc}",
-            flush=True,
-        )
-        if self.show_hex or not f.fcs_ok:
-            print("    " + f.psdu.hex(" "), flush=True)
+        if not self.quiet:
+            ts = time.strftime("%H:%M:%S", time.localtime(wall)) + f".{int((wall % 1) * 1000):03d}"
+            ch = f"ch{f.channel}" if f.channel else "    "
+            status = "" if f.fcs_ok else " BAD-FCS"
+            desc = mac.parse(f.psdu, self.zigbee).summary() if f.fcs_ok else ""
+            print(
+                f"{ts} {ch} {f.rssi_dbfs:6.1f}dBFS snr{f.snr_db:5.1f} cfo{f.cfo_hz / 1e3:+7.1f}k "
+                f"lqi{f.lqi:4d} len{len(f.psdu):4d}{status}  {desc}",
+                file=self.out,
+                flush=True,
+            )
+            if self.show_hex or not f.fcs_ok:
+                print("    " + f.psdu.hex(" "), file=self.out, flush=True)
         if self.pcap and (f.fcs_ok or self.pcap_bad):
-            self.pcap.write(f.psdu, wall, f.channel)
-
-    pcap_bad = False
+            try:
+                self.pcap.write(f.psdu, wall, f.channel)
+            except (BrokenPipeError, OSError) as exc:
+                raise PipeClosed(str(exc)) from exc
 
 
 def open_pcap(path: str | None) -> PcapWriter | None:
+    """PCAP writer for a file name, or for stdout when path is '-'."""
     if not path:
         return None
+    if path == "-":
+        return PcapWriter(sys.stdout.buffer)
     return PcapWriter(open(path, "wb"))
+
+
+def make_printer(args, quiet: bool = False) -> Printer:
+    pcap = open_pcap(args.pcap)
+    out = sys.stderr if args.pcap == "-" else sys.stdout
+    return Printer(args.hex, pcap, out=out, quiet=quiet, pcap_bad=args.bad)
 
 
 def make_demod(args, channel: int | None, offset: float, fs: float) -> Demodulator:
@@ -149,56 +200,63 @@ def _status(demod: Demodulator, dev, stream: _Stream, extra: str = "") -> None:
     )
 
 
-def cmd_live(args) -> int:
+def run_live(args, printer: Printer, verbose: bool = True) -> int:
+    """Receive one channel with the HackRF until Ctrl+C, the duration, or the
+    PCAP consumer closing its end (Wireshark stopping the capture)."""
     channel = args.channel
     dev = _open_hackrf(args, channel)
     demod = make_demod(args, channel, args.offset, args.fs)
-    pcap = open_pcap(args.pcap)
-    printer = Printer(args.hex, pcap)
-    printer.pcap_bad = args.bad
     stream = _Stream(dev, args.fs)
-    print(
-        f"# HackRF: ch{channel} {phy.channel_freq(channel) / 1e6:.0f} MHz, LO "
-        f"{(phy.channel_freq(channel) + args.offset) / 1e6:.3f} MHz, fs {args.fs / 1e6:g} Msps, "
-        f"LNA {dev.lna_db} dB, VGA {dev.vga_db} dB, amp {'on' if dev.amp else 'off'}, "
-        f"BB filter {dev.bb_filter_hz / 1e6:g} MHz.  Ctrl+C to stop.",
-        file=sys.stderr,
-    )
+    if verbose:
+        print(
+            f"# HackRF: ch{channel} {phy.channel_freq(channel) / 1e6:.0f} MHz, LO "
+            f"{(phy.channel_freq(channel) + args.offset) / 1e6:.3f} MHz, fs {args.fs / 1e6:g} Msps, "
+            f"LNA {dev.lna_db} dB, VGA {dev.vga_db} dB, amp {'on' if dev.amp else 'off'}, "
+            f"BB filter {dev.bb_filter_hz / 1e6:g} MHz.  Ctrl+C to stop.",
+            file=sys.stderr,
+        )
     dev.start()
     t_end = time.time() + args.duration if args.duration else None
     t_stat = time.time() + args.status
     busy = 0.0
     t_begin = time.time()
+    rc = 0
     try:
         while t_end is None or time.time() < t_end:
             iq = stream.next_iq()
             if iq is None:
                 if not dev.is_streaming():
                     print("# HackRF stopped streaming", file=sys.stderr)
-                    return 1
+                    rc = 1
+                    break
                 continue
             t = time.perf_counter()
             for f in demod.process(iq):
                 printer.frame(f, stream.t0 + f.sample / args.fs)
             busy += time.perf_counter() - t
-            if args.status and time.time() > t_stat:
+            if verbose and args.status and time.time() > t_stat:
                 load = 100 * busy / (time.time() - t_begin)
                 _status(demod, dev, stream, f"cpu {load:.0f}%")
                 t_stat = time.time() + args.status
     except KeyboardInterrupt:
         pass
+    except PipeClosed:
+        _pipe_closed(printer, verbose)
     finally:
         dev.close()
-    _status(demod, dev, stream)
-    return 0
+    if verbose:
+        _status(demod, dev, stream)
+    return rc
+
+
+def cmd_live(args) -> int:
+    return run_live(args, make_printer(args))
 
 
 def cmd_scan(args) -> int:
     channels = parse_channels(args.channels)
     dev = _open_hackrf(args, channels[0])
-    pcap = open_pcap(args.pcap)
-    printer = Printer(args.hex, pcap)
-    printer.pcap_bad = args.bad
+    printer = make_printer(args)
     stream = _Stream(dev, args.fs)
     summary = {ch: {"frames": 0, "bad": 0, "pans": set(), "srcs": set()} for ch in channels}
     settle = int(0.08 * args.fs) * 2  # bytes to drop after retune
@@ -240,13 +298,19 @@ def cmd_scan(args) -> int:
                 )
     except KeyboardInterrupt:
         pass
+    except PipeClosed:
+        _pipe_closed(printer)
     finally:
         dev.close()
-    print("\nchannel  MHz   frames  PAN IDs              devices(src)")
+    out = printer.out
+    print("\nchannel  MHz   frames  PAN IDs              devices(src)", file=out)
     for ch in channels:
         s = summary[ch]
         pans = ",".join(f"0x{p:04x}" for p in sorted(s["pans"])) or "-"
-        print(f"  {ch:3d}   {phy.channel_freq(ch) / 1e6:.0f}  {s['frames']:6d}  {pans:20s} {len(s['srcs'])}")
+        print(
+            f"  {ch:3d}   {phy.channel_freq(ch) / 1e6:.0f}  {s['frames']:6d}  {pans:20s} {len(s['srcs'])}",
+            file=out,
+        )
     return 0
 
 
@@ -285,6 +349,11 @@ def cmd_record(args) -> int:
 
 
 def cmd_file(args) -> int:
+    return decode_file(args, make_printer(args))
+
+
+def decode_file(args, printer: Printer, verbose: bool = True) -> int:
+    """Decode a recording (args.input) using its .json sidecar when present."""
     path = Path(args.input)
     meta = {}
     side = path.with_suffix(path.suffix + ".json")
@@ -296,10 +365,8 @@ def cmd_file(args) -> int:
     fmt = args.format or meta.get("format") or ("cf32" if path.suffix in (".cf32", ".cfile", ".fc32") else "cs8")
     t_start = meta.get("start_time", path.stat().st_mtime - path.stat().st_size / (2 if fmt == "cs8" else 8) / fs)
     demod = make_demod(args, channel, offset, fs)
-    pcap = open_pcap(args.pcap)
-    printer = Printer(args.hex, pcap)
-    printer.pcap_bad = args.bad
-    print(f"# {path}: {fmt}, fs {fs / 1e6:g} Msps, offset {offset / 1e6:g} MHz, ch {channel}", file=sys.stderr)
+    if verbose:
+        print(f"# {path}: {fmt}, fs {fs / 1e6:g} Msps, offset {offset / 1e6:g} MHz, ch {channel}", file=sys.stderr)
     item = 2 if fmt == "cs8" else 8
     chunk = 1 << 20
     t = time.perf_counter()
@@ -319,11 +386,12 @@ def cmd_file(args) -> int:
     for fr in demod.flush():
         printer.frame(fr, t_start + fr.sample / fs)
     dt = time.perf_counter() - t
-    print(
-        f"# {total / fs:.2f} s of signal in {dt:.2f} s ({total / fs / dt:.1f}x real time); "
-        f"stats {demod.stats}",
-        file=sys.stderr,
-    )
+    if verbose:
+        print(
+            f"# {total / fs:.2f} s of signal in {dt:.2f} s ({total / fs / dt:.1f}x real time); "
+            f"stats {demod.stats}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -355,7 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, radio: bool):
-        sp.add_argument("--pcap", help="write decoded frames to a PCAP file (Wireshark)")
+        sp.add_argument(
+            "--pcap",
+            help="write decoded frames to a PCAP file; '-' streams PCAP to stdout "
+            "(e.g. | wireshark -k -i -), frame lines then go to stderr",
+        )
         sp.add_argument("--hex", action="store_true", help="print frame bytes")
         sp.add_argument("--bad", action="store_true", help="also report frames with bad FCS")
         sp.add_argument(
@@ -420,12 +492,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("selftest", help="synthetic end-to-end test (no hardware)")
     sp.add_argument("--frames", type=int, default=100)
     sp.set_defaults(func=cmd_selftest)
+
+    sp = sub.add_parser(
+        "extcap-install",
+        help="install the Wireshark extcap interface (Zigbee capture from Wireshark's interface list)",
+    )
+    sp.add_argument("--dir", help="extcap folder (default: Wireshark's personal extcap folder)")
+    sp.add_argument("--uninstall", action="store_true", help="remove the interface")
+    sp.set_defaults(func=cmd_extcap_install)
     return p
+
+
+def cmd_extcap_install(args) -> int:
+    from . import extcap
+
+    return extcap.install(args.dir, uninstall=args.uninstall)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args) or 0
+    try:
+        return args.func(args) or 0
+    except PipeClosed:  # e.g. 'zbdemod file x.cs8 --pcap - | tshark -c 3 -r -'
+        release_dead_stdout()
+        return 0
 
 
 if __name__ == "__main__":
