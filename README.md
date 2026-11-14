@@ -31,6 +31,14 @@ Highlights:
   (AES-CCM\*, pure Python).
 - **No GNU Radio.** libhackrf is driven directly through `ctypes`.
 
+![zbdemod map: live map of a real Zigbee network on channel 11, decrypted with its network key](examples/map-example.png)
+
+*`zbdemod map --keys ...` on a real home network (channel 11, 18 devices), decrypted with
+its own network key. The coordinator 0x0000 sits in the middle. Router-to-router links
+come from decrypted Link Status frames and are coloured by link cost (brighter = better).
+Hollow devices are known only from their neighbours' reports. The frame log at the bottom
+shows the decrypted Link Status lists.*
+
 ## Installation
 
 ```sh
@@ -132,7 +140,7 @@ zbdemod map --file ch15.cs8          # from a raw IQ recording
 `zbdemod map` starts a small local web server (standard library only, no extra
 packages, works offline) at <http://localhost:8088/> and opens the browser. The page
 draws every network it hears, the devices in it and the radio links between them,
-and updates live:
+and updates live (see the screenshot at the top):
 
 - **Networks** (PAN ID, channel, extended PAN ID once a beacon is seen, encryption,
   permit join) in a list. Devices are coloured by network or by signal strength.
@@ -327,7 +335,7 @@ counts one device of a neighbouring network:
 | `zbdemod/hackrf.py` | `ctypes` binding to libhackrf (streaming RX, retuning) |
 | `zbdemod/sim.py` | channel simulator (CFO, phase, clock drift, AWGN, IF offset) |
 | `zbdemod/cli.py` | `live`, `scan`, `record`, `file`, `map`, `selftest`, `extcap-install` commands |
-| `examples/` | synthetic IQ recording (encrypted with the made-up `synthetic.key`), its decoded PCAP and the generator script |
+| `examples/` | synthetic IQ recording (encrypted with the made-up `synthetic.key`), its decoded PCAP, the generator script, and a screenshot of the map |
 | `tests/` | pytest suite |
 
 ## Tests
